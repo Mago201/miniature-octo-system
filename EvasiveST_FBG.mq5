@@ -38,9 +38,24 @@
 //|   8) Опция InpHtfFailOpen — поведение при недоступном HTF        |
 //|      (htf==0): true — пропускать сигналы, false — блокировать.   |
 //|   9) Визуальный бейдж в углу графика со статусом HTF (Up/Dn/--). |
+//|                                                                  |
+//|  Версия 2.03 — корректность HTF-анализа:                         |
+//|  10) HTFTrendAt() сделан look-ahead-safe: для LTF-бара с временем|
+//|      t возвращается тренд ПРЕДЫДУЩЕГО (уже закрытого) HTF-бара,  |
+//|      а не того HTF-бара, в котором t ещё формируется. Раньше     |
+//|      фильтр и бэктест «подсматривали» в будущее — тренд HTF-бара |
+//|      определяется его close, который для LTF-бара ещё не настал. |
+//|  11) На warm-up HTF (первые p баров) тренд помечается как        |
+//|      «нет данных» (0), чтобы фильтр не считал ранний период      |
+//|      по умолчанию бычьим. Поведение управляется InpHtfFailOpen.  |
+//|  12) Лимит истории HTF поднят с 5 000 до 50 000 баров, чтобы     |
+//|      длинные LTF-истории не «проседали» на дефолт g_htf[0].      |
+//|  13) Бейдж теперь показывает именно тот HTF-тренд, который       |
+//|      реально подаётся в фильтр (закрытый бар), а в скобках —     |
+//|      «живой» тренд текущего, ещё формирующегося HTF-бара.        |
 //+------------------------------------------------------------------+
 #property copyright "Devin"
-#property version   "2.02"
+#property version   "2.03"
 #property description "СуперТренд с уходом от шума + ложный пробой по Герчику (фильтр по тренду и встречный крест)"
 #property indicator_chart_window
 #property indicator_buffers 18
@@ -225,12 +240,22 @@ void UpdateHTFBadge(const datetime barTime)
       return;
      }
 
+   //--- (правка #13) показываем именно тот тренд HTF, который реально
+   //    подаётся в фильтр (закрытый HTF-бар = HTFTrendAt). В скобках —
+   //    «живой» тренд текущего, ещё формирующегося HTF-бара.
    int htf = HTFTrendAt(barTime);
-   string txt;
+   int n   = ArraySize(g_htf);
+   int liveTrend = (n > 0) ? g_htf[n-1].trend : 0;
+
+   string mainTxt;
    color  clr;
-   if(htf > 0)      { txt = "HTF " + EnumToString(InpHTF) + ": Up";  clr = clrLimeGreen; }
-   else if(htf < 0) { txt = "HTF " + EnumToString(InpHTF) + ": Dn";  clr = clrTomato;    }
-   else             { txt = "HTF " + EnumToString(InpHTF) + ": --";  clr = clrSilver;    }
+   if(htf > 0)      { mainTxt = "Up"; clr = clrLimeGreen; }
+   else if(htf < 0) { mainTxt = "Dn"; clr = clrTomato;    }
+   else             { mainTxt = "--"; clr = clrSilver;    }
+
+   string liveTxt = (liveTrend > 0) ? "Up" : (liveTrend < 0 ? "Dn" : "--");
+   string txt = StringFormat("HTF %s: %s (live %s)",
+                             EnumToString(InpHTF), mainTxt, liveTxt);
 
    if(ObjectFind(0, HTF_BADGE_NAME) < 0)
      {
@@ -401,7 +426,10 @@ void RebuildHTFTrend()
 
    int bars = Bars(_Symbol, InpHTF);
    if(bars < 5) return;
-   int want = MathMin(bars, 5000);
+   //--- (правка #12) расширяем окно истории HTF: 5 000 H1-баров — это
+   //    всего ~208 суток, на длинных LTF-историях HTFTrendAt() падал
+   //    на g_htf[0] (сид) и систематически возвращал тренд по умолчанию.
+   int want = MathMin(bars, 50000);
    MqlRates r[];
    int copied = CopyRates(_Symbol, InpHTF, 0, want, r);
    if(copied < 5) return;
@@ -411,7 +439,10 @@ void RebuildHTFTrend()
    double sumTr = 0.0;
    int    p = (InpHtfAtrPeriod < 1) ? 1 : InpHtfAtrPeriod;
    int trend = 1;
-   g_htf[0].time = r[0].time; g_htf[0].trend = trend;
+   //--- (правка #11) на warm-up HTF (первые p баров) трендa нет.
+   //    Раньше тут сидилось trend=1 и фильтр считал ранний период
+   //    «бычьим по умолчанию», что давало систематический перекос.
+   g_htf[0].time = r[0].time; g_htf[0].trend = 0;
 
    for(int i=1; i<copied; ++i)
      {
@@ -437,7 +468,9 @@ void RebuildHTFTrend()
       if(trend == 1)  trend = (r[i].close < fl) ? -1 :  1;
       else            trend = (r[i].close > fu) ?  1 : -1;
 
-      g_htf[i].trend = trend;
+      //--- (правка #11) пока ATR ещё «сидится», тренд считаем неизвестным:
+      //    выдавать его наружу нельзя — фильтр должен видеть 0 (нет данных).
+      g_htf[i].trend = (i < p) ? 0 : trend;
       prevUpper = fu; prevLower = fl;
      }
    g_htfLastUpdate = lastHTFBar;
@@ -447,6 +480,7 @@ int HTFTrendAt(const datetime t)
   {
    int n = ArraySize(g_htf);
    if(n == 0) return 0;
+   //--- бинарным поиском находим HTF-бар, в который попадает время t
    int lo=0, hi=n-1, ans=-1;
    while(lo <= hi)
      {
@@ -454,7 +488,17 @@ int HTFTrendAt(const datetime t)
       if(g_htf[mid].time <= t) { ans = mid; lo = mid+1; }
       else hi = mid-1;
      }
-   return (ans < 0) ? 0 : g_htf[ans].trend;
+   if(ans < 0) return 0;
+
+   //--- (правка #10) look-ahead-safe: тренд HTF-бара ans вычислен по
+   //    его close, который для LTF-бара со временем t ещё в БУДУЩЕМ.
+   //    Использовать его в фильтре — это «подсматривать в ответ».
+   //    Поэтому возвращаем тренд ПРЕДЫДУЩЕГО HTF-бара (уже закрытого).
+   //    На warm-up (ans-1 ещё в зоне сида) trend == 0 — «нет данных»,
+   //    дальнейшее поведение определяется InpHtfFailOpen.
+   int idx = ans - 1;
+   if(idx < 0) return 0;
+   return g_htf[idx].trend;
   }
 
 //+------------------------------------------------------------------+
