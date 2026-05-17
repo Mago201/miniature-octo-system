@@ -29,9 +29,18 @@
 //|   6) Введена PipSize() с авто-коррекцией для 3/5-знаков, чтобы   |
 //|      InpFBGOffsetPts работал в "пунктах трейдера", а не в        |
 //|      _Point=0.00001 (пятые знаки).                               |
+//|                                                                  |
+//|  Версия 2.02 — расширение HTF-фильтра:                           |
+//|   7) HTF-фильтр теперь применяется и к сигналам Герчика, и к     |
+//|      встречному кресту (раньше учитывался только в стрелках ST). |
+//|      Стрелка FBG требует совпадения LTF и HTF трендов.           |
+//|      Крест рисуется при противоречии с LTF ИЛИ с HTF.            |
+//|   8) Опция InpHtfFailOpen — поведение при недоступном HTF        |
+//|      (htf==0): true — пропускать сигналы, false — блокировать.   |
+//|   9) Визуальный бейдж в углу графика со статусом HTF (Up/Dn/--). |
 //+------------------------------------------------------------------+
 #property copyright "Devin"
-#property version   "2.01"
+#property version   "2.02"
 #property description "СуперТренд с уходом от шума + ложный пробой по Герчику (фильтр по тренду и встречный крест)"
 #property indicator_chart_window
 #property indicator_buffers 18
@@ -114,6 +123,9 @@ input bool               InpUseHTF         = false;      // Фильтр сиг�
 input ENUM_TIMEFRAMES    InpHTF            = PERIOD_H1;  // Старший таймфрейм
 input int                InpHtfAtrPeriod   = 10;         // Период ATR на старшем ТФ
 input double             InpHtfMultiplier  = 3.0;        // Множитель ATR на старшем ТФ
+input bool               InpHtfFailOpen    = true;       // При недоступном HTF (htf=0) пропускать сигналы
+input bool               InpHtfShowBadge   = true;       // Показывать бейдж со статусом HTF в углу
+input ENUM_BASE_CORNER   InpHtfBadgeCorner = CORNER_RIGHT_UPPER; // Угол для бейджа
 
 input group "=== Визуализация СуперТренда ==="
 input bool               InpShowSignals    = true;       // Рисовать стрелки быч./медв. входа
@@ -175,6 +187,9 @@ datetime    g_lastSTAlertTime  = 0;
 datetime    g_lastFBGAlertTime = 0;
 datetime    g_lastCrossAlertTime = 0;
 
+//--- имя графического объекта-бейджа HTF
+const string HTF_BADGE_NAME = "EvST_FBG_HTF_Badge";
+
 //+------------------------------------------------------------------+
 //| Размер «пункта трейдера» с авто-коррекцией для 3/5-знаков        |
 //+------------------------------------------------------------------+
@@ -183,6 +198,59 @@ double PipSize()
    int d = (int)_Digits;
    if(d == 3 || d == 5) return _Point * 10.0;
    return _Point;
+  }
+
+//+------------------------------------------------------------------+
+//| (правка #7-#8) Проверка разрешения сигнала по HTF                |
+//|   side = +1 для бычьего, -1 для медвежьего                       |
+//|   Возвращает true, если HTF не запрещает сигнал в эту сторону.   |
+//+------------------------------------------------------------------+
+bool HTFAllows(const datetime t, const int side)
+  {
+   if(!InpUseHTF) return true;
+   int htf = HTFTrendAt(t);
+   if(htf == 0) return InpHtfFailOpen; // данных нет — fail-open/closed по флагу
+   return (side == 1) ? (htf >= 0) : (htf <= 0);
+  }
+
+//+------------------------------------------------------------------+
+//| (правка #9) Создать/обновить бейдж со статусом HTF               |
+//+------------------------------------------------------------------+
+void UpdateHTFBadge(const datetime barTime)
+  {
+   if(!InpUseHTF || !InpHtfShowBadge)
+     {
+      if(ObjectFind(0, HTF_BADGE_NAME) >= 0)
+         ObjectDelete(0, HTF_BADGE_NAME);
+      return;
+     }
+
+   int htf = HTFTrendAt(barTime);
+   string txt;
+   color  clr;
+   if(htf > 0)      { txt = "HTF " + EnumToString(InpHTF) + ": Up";  clr = clrLimeGreen; }
+   else if(htf < 0) { txt = "HTF " + EnumToString(InpHTF) + ": Dn";  clr = clrTomato;    }
+   else             { txt = "HTF " + EnumToString(InpHTF) + ": --";  clr = clrSilver;    }
+
+   if(ObjectFind(0, HTF_BADGE_NAME) < 0)
+     {
+      if(!ObjectCreate(0, HTF_BADGE_NAME, OBJ_LABEL, 0, 0, 0)) return;
+      ObjectSetInteger(0, HTF_BADGE_NAME, OBJPROP_CORNER,    InpHtfBadgeCorner);
+      ObjectSetInteger(0, HTF_BADGE_NAME, OBJPROP_XDISTANCE, 12);
+      ObjectSetInteger(0, HTF_BADGE_NAME, OBJPROP_YDISTANCE, 20);
+      ObjectSetInteger(0, HTF_BADGE_NAME, OBJPROP_FONTSIZE,  10);
+      ObjectSetString (0, HTF_BADGE_NAME, OBJPROP_FONT,      "Arial Bold");
+      ObjectSetInteger(0, HTF_BADGE_NAME, OBJPROP_HIDDEN,    true);
+      ObjectSetInteger(0, HTF_BADGE_NAME, OBJPROP_BACK,      false);
+      ObjectSetInteger(0, HTF_BADGE_NAME, OBJPROP_SELECTABLE,false);
+      // Привязка по углу: для правого угла текст выравнивается вправо
+      bool rightCorner = (InpHtfBadgeCorner == CORNER_RIGHT_UPPER ||
+                          InpHtfBadgeCorner == CORNER_RIGHT_LOWER);
+      ObjectSetInteger(0, HTF_BADGE_NAME, OBJPROP_ANCHOR,
+                       rightCorner ? ANCHOR_RIGHT_UPPER : ANCHOR_LEFT_UPPER);
+     }
+   ObjectSetString (0, HTF_BADGE_NAME, OBJPROP_TEXT,  txt);
+   ObjectSetInteger(0, HTF_BADGE_NAME, OBJPROP_COLOR, clr);
   }
 
 //+------------------------------------------------------------------+
@@ -254,7 +322,13 @@ int OnInit()
    return INIT_SUCCEEDED;
   }
 
-void OnDeinit(const int reason) { ArrayFree(g_atr); ArrayFree(g_htf); }
+void OnDeinit(const int reason)
+  {
+   ArrayFree(g_atr);
+   ArrayFree(g_htf);
+   if(ObjectFind(0, HTF_BADGE_NAME) >= 0)
+      ObjectDelete(0, HTF_BADGE_NAME);
+  }
 
 //================== Вспомогательные функции =======================
 double TrueRange(const double h, const double l, const double pc)
@@ -577,20 +651,14 @@ int OnCalculate(const int rates_total,
       //    предыдущего тренда: BufTrend[0] был засеян значением 1, и любой
       //    реальный медвежий старт давал бы ложный «флип». Подавляем.
       bool flipped = (i > 1) && (trend != prevTrend);
-      bool htfBuyOk = true, htfSellOk = true;
-      if(InpUseHTF)
-        {
-         int htf = HTFTrendAt(time[i]);
-         htfBuyOk  = (htf >= 0);
-         htfSellOk = (htf <= 0);
-        }
 
       BufSTBull[i] = EMPTY_VALUE;
       BufSTBear[i] = EMPTY_VALUE;
       if(flipped && InpShowSignals)
         {
-         if(trend ==  1 && htfBuyOk)       BufSTBull[i] = low[i]  - atr*0.5;
-         else if(trend == -1 && htfSellOk) BufSTBear[i] = high[i] + atr*0.5;
+         //--- (правка #7) HTF-фильтр через единый HTFAllows()
+         if(trend ==  1 && HTFAllows(time[i],  1)) BufSTBull[i] = low[i]  - atr*0.5;
+         else if(trend == -1 && HTFAllows(time[i], -1)) BufSTBear[i] = high[i] + atr*0.5;
         }
 
       //================ Блок ложного пробоя по Герчику =============
@@ -631,9 +699,15 @@ int OnCalculate(const int rates_total,
       // не терять предупреждение об ослаблении тренда на больших барах.
       bool bodyOk = !(InpFBGMaxBodyATR > 0.0 && atr > 0.0 && body > atr * InpFBGMaxBodyATR);
 
-      // фильтр по направлению тренда ST
-      bool withTrend    = (isBuy  && trend ==  1) || (isSell && trend == -1);
-      bool counterTrend = (isBuy  && trend == -1) || (isSell && trend ==  1);
+      //--- (правка #7) фильтр по тренду: учитываем И LTF-ST, И HTF-ST.
+      //    sigSide = +1 для бычьего сигнала FBG, -1 для медвежьего.
+      int  sigSide   = isBuy ? 1 : -1;
+      bool ltfAgree  = (sigSide == trend);
+      bool htfAgree  = HTFAllows(time[i], sigSide);
+      bool withTrend = ltfAgree && htfAgree;          // согласие везде
+      // counterTrend ⇔ есть противоречие на любом уровне
+      // (ltf против ИЛИ htf против). Это и есть «раннее предупреждение
+      //  ослабления тренда» — чем мы и хотели насытить крест.
 
       if(withTrend && bodyOk)
         {
@@ -651,12 +725,12 @@ int OnCalculate(const int rates_total,
                        DoubleToString(isBuy ? ll : lh, _Digits)));
            }
         }
-      else if(counterTrend)
+      else
         {
-         //--- (правка #4) если будем рисовать встречный крест, то стрелку
-         //    Герчика на этом же баре НЕ рисуем — иначе они визуально
-         //    налезают друг на друга. Стрелка остаётся только когда
-         //    встречный крест отключён, а фильтр «только по тренду» — снят.
+         //--- (правка #4 + #7) если будем рисовать встречный крест,
+         //    стрелку Герчика на этом же баре НЕ рисуем — они визуально
+         //    налезают. Стрелка остаётся только когда крест отключён,
+         //    а фильтр «только по тренду» — снят.
          bool drawCross = InpDrawCounterCross;
 
          if(!drawCross && !InpOnlyWithTrend && bodyOk)
@@ -667,19 +741,23 @@ int OnCalculate(const int rates_total,
 
          if(drawCross)
            {
-            // ставим крест над/под баром в зависимости от направления тренда:
-            // встречный сигнал к лонгу (isSell при trend=1) ставим над high
-            // встречный сигнал к шорту (isBuy  при trend=-1) ставим под low
-            if(trend == 1) BufFBGCross[i] = high[i] + fbgOffset;
-            else           BufFBGCross[i] = low[i]  - fbgOffset;
+            //--- позиция креста: над high для встречи лонгу,
+            //    под low — для встречи шорту. Привязка идёт к тому,
+            //    КУДА смотрит сам сигнал FBG (sigSide), а не к LTF-trend,
+            //    потому что HTF мог развернуться раньше LTF.
+            if(sigSide == 1) BufFBGCross[i] = low[i]  - fbgOffset; // встречный лонг → крест под low
+            else             BufFBGCross[i] = high[i] + fbgOffset; // встречный шорт → крест над high
 
             if(!firstPass && InpAlertOnCounter && i == alertBarIdx
                && time[i] != g_lastCrossAlertTime)
               {
                g_lastCrossAlertTime = time[i];
-               string side = (trend == 1) ? "лонга" : "шорта";
-               FireAlert(StringFormat("Герчик встречный сигнал против %s | %s %s @ %s",
-                          side, _Symbol, EnumToString((ENUM_TIMEFRAMES)_Period),
+               string side  = (sigSide == 1) ? "шорта" : "лонга";
+               string cause = !ltfAgree && !htfAgree ? "LTF+HTF"
+                              : !ltfAgree            ? "LTF"
+                              :                        "HTF";
+               FireAlert(StringFormat("Герчик встречный сигнал против %s [%s] | %s %s @ %s",
+                          side, cause, _Symbol, EnumToString((ENUM_TIMEFRAMES)_Period),
                           DoubleToString(close[i], _Digits)));
               }
            }
@@ -694,15 +772,9 @@ int OnCalculate(const int rates_total,
       datetime barT = time[alertBarIdx];
       if(curTrend != prevTrend && g_lastSTAlertTime != barT)
         {
-         bool htfBuyOk = true, htfSellOk = true;
-         if(InpUseHTF)
-           {
-            int htf = HTFTrendAt(barT);
-            htfBuyOk  = (htf >= 0);
-            htfSellOk = (htf <= 0);
-           }
-         bool fireBuy  = (curTrend ==  1 && htfBuyOk);
-         bool fireSell = (curTrend == -1 && htfSellOk);
+         //--- (правка #7) единый HTFAllows() и здесь
+         bool fireBuy  = (curTrend ==  1) && HTFAllows(barT,  1);
+         bool fireSell = (curTrend == -1) && HTFAllows(barT, -1);
          if(fireBuy || fireSell)
            {
             g_lastSTAlertTime = barT;
@@ -713,6 +785,10 @@ int OnCalculate(const int rates_total,
            }
         }
      }
+
+   //--- (правка #9) обновляем бейдж HTF на каждом расчёте
+   if(rates_total >= 1)
+      UpdateHTFBadge(time[rates_total-1]);
 
    return rates_total;
   }
