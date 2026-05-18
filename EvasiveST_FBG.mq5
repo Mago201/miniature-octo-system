@@ -55,13 +55,34 @@
 //|      Efficiency Ratio в адаптивном ATR (вместо O(n) на бар).    |
 //|  15) Косметика: короткий лейбл таймфрейма в алертах (M15, H1)    |
 //|      вместо PERIOD_M15.                                          |
+//|                                                                  |
+//|  Версия 2.04 — анти-спам, объём, ретест, SL/TP, инкр. HTF:       |
+//|  16) (A) Кулдаун стрелок FBG: InpFBGCooldownBars — N баров после |
+//|      сигнала повторные стрелки той же стороны не рисуются.       |
+//|  17) (B) Объёмный фильтр пробоя: InpFBGUseVolume +               |
+//|      InpFBGMinVolMult. Тик-объём бара пробоя ≥ среднему за       |
+//|      окно Lookback × множитель.                                  |
+//|  18) (F) Ретест уровня: InpFBGRequireRetest + InpFBGRetestBars.  |
+//|      Стрелка FBG рисуется не на баре пробоя, а на баре, где      |
+//|      цена в окне M ретестировала уровень и снова от него         |
+//|      развернулась — классический сетап Герчика.                  |
+//|  19) (C) Подсказки SL/TP: InpDrawSLTP + InpFBGSLBufferATR +      |
+//|      InpFBGTP1ATR/InpFBGTP2ATR. На баре сигнала FBG отрисовы-   |
+//|      ваются три точки: SL за хвостом пробоя, TP1 и TP2 в ATR.   |
+//|  20) (D) Расширенный бейдж со счётчиками за день:                |
+//|      InpHtfBadgeStats — добавляет строку «ST/Buy/Sell/Cross».    |
+//|  21) (E) Инкрементальный пересчёт HTF-кэша: при появлении        |
+//|      нового HTF-бара пересчитывается только хвост массива,       |
+//|      а не все 5000 баров.                                        |
+//|  22) (G) Рефакторинг: блок Герчика вынесен в ProcessFBG();       |
+//|      OnCalculate стал линейным и читаемым.                       |
 //+------------------------------------------------------------------+
 #property copyright "Devin"
-#property version   "2.03"
-#property description "СуперТренд+Герчик: HTF-фильтр, уровни FBG, линия HTF ST, CSV-лог"
+#property version   "2.04"
+#property description "СуперТренд+Герчик: ретест, объём, SL/TP, кулдаун, инкр. HTF, статистика"
 #property indicator_chart_window
-#property indicator_buffers 22
-#property indicator_plots   11
+#property indicator_buffers 25
+#property indicator_plots   14
 
 //--- Plot 0: основная линия СуперТренда (сплошная)
 #property indicator_label1   "СуперТренд"
@@ -132,6 +153,24 @@
 #property indicator_color11  clrSteelBlue
 #property indicator_style11  STYLE_DOT
 #property indicator_width11  1
+
+//--- Plot 11: SL-маркер для FBG-сигнала (v2.04)
+#property indicator_label12  "FBG SL"
+#property indicator_type12   DRAW_ARROW
+#property indicator_color12  clrCrimson
+#property indicator_width12  1
+
+//--- Plot 12: TP1-маркер для FBG-сигнала (v2.04)
+#property indicator_label13  "FBG TP1"
+#property indicator_type13   DRAW_ARROW
+#property indicator_color13  clrMediumSeaGreen
+#property indicator_width13  1
+
+//--- Plot 13: TP2-маркер для FBG-сигнала (v2.04)
+#property indicator_label14  "FBG TP2"
+#property indicator_type14   DRAW_ARROW
+#property indicator_color14  clrForestGreen
+#property indicator_width14  1
 
 //================== Перечисления =====================================
 enum ENUM_FBG_LEVEL_MODE
@@ -208,6 +247,26 @@ input bool               InpLogSTFlip      = true;       // Логировать
 input bool               InpLogFBG         = true;       // Логировать сигналы Герчика (BUY/SELL)
 input bool               InpLogCounter     = true;       // Логировать встречные кресты
 
+input group "=== v2.04: анти-спам и фильтры FBG ==="
+input int                InpFBGCooldownBars = 3;         // Кулдаун (баров) между стрелками FBG одной стороны (0 — выкл.)
+input bool               InpFBGUseVolume   = false;      // Включить объёмный фильтр пробоя (тик-объём)
+input double             InpFBGMinVolMult  = 1.5;        // Мин. множитель к среднему тик-объёму окна Lookback
+
+input group "=== v2.04: ретест уровня ==="
+input bool               InpFBGRequireRetest = false;    // Требовать ретест уровня после пробоя
+input int                InpFBGRetestBars    = 5;        // Окно ожидания ретеста (баров)
+
+input group "=== v2.04: подсказки SL/TP ==="
+input bool               InpDrawSLTP       = false;      // Рисовать маркеры SL/TP1/TP2 на сигнале FBG
+input double             InpFBGSLBufferATR = 0.25;       // Буфер SL за хвостом пробоя (xATR)
+input double             InpFBGTP1ATR      = 1.0;        // Дистанция TP1 от входа (xATR)
+input double             InpFBGTP2ATR      = 2.0;        // Дистанция TP2 от входа (xATR)
+input int                InpSLArrowCode    = 119;        // Wingdings: маркер SL (119 — горизонтальная линия)
+input int                InpTPArrowCode    = 119;        // Wingdings: маркер TP
+
+input group "=== v2.04: счётчики в бейдже ==="
+input bool               InpHtfBadgeStats  = false;      // Показывать счётчики ST/Buy/Sell/Cross за день
+
 //================== Буферы индикатора ============================
 double BufSTSolid[];       // 0
 double BufSTSolidCol[];    // 1
@@ -227,10 +286,13 @@ double BufHtfST[];         // 14 (v2.03) — линия HTF ST
 double BufHtfSTCol[];      // 15 (v2.03) — цветовой индекс HTF ST
 double BufFBGHigh[];       // 16 (v2.03) — линия HH (сопротивление)
 double BufFBGLow[];        // 17 (v2.03) — линия LL (поддержка)
-double BufTrend[];         // 18 calc
-double BufFU[];            // 19 calc - final upper
-double BufFL[];            // 20 calc - final lower
-double BufEvasive[];       // 21 calc - 1 if evasive mode active
+double BufFBGSL[];         // 18 (v2.04) — маркер SL
+double BufFBGTP1[];        // 19 (v2.04) — маркер TP1
+double BufFBGTP2[];        // 20 (v2.04) — маркер TP2
+double BufTrend[];         // 21 calc
+double BufFU[];            // 22 calc - final upper
+double BufFL[];            // 23 calc - final lower
+double BufEvasive[];       // 24 calc - 1 if evasive mode active
 
 //================== Состояние индикатора =========================
 double      g_atr[];
@@ -242,12 +304,43 @@ HTFTrendBar g_htf[];
 datetime    g_htfLastUpdate = 0;
 //--- (v2.03) инкрементальный курсор для HTFTrendAt по монотонному времени
 int         g_htfCursor = 0;
+//--- (v2.04 #21) состояние HTF SuperTrend между пересчётами (для инкр. достройки)
+double      g_htfPrevUpper = 0.0;
+double      g_htfPrevLower = 0.0;
+double      g_htfAtr       = 0.0;
+double      g_htfAtrSum    = 0.0;
+int         g_htfTrend     = 1;
 datetime    g_lastSTAlertTime  = 0;
 datetime    g_lastFBGAlertTime = 0;
 datetime    g_lastCrossAlertTime = 0;
 //--- (v2.03) кэш handle лог-файла (файл переоткрывается реже)
 int         g_logHandle = INVALID_HANDLE;
 string      g_logFileName = "";
+
+//--- (v2.04 #16) индексы последних отрисованных стрелок FBG для кулдауна
+int         g_lastBuyBar  = -1;
+int         g_lastSellBar = -1;
+
+//--- (v2.04 #18) ожидающие ретест сигналы (по одному на сторону)
+struct FBGPending
+  {
+   bool     active;     // ждём ли ретеста
+   int      sigBar;     // индекс бара ложного пробоя
+   datetime sigTime;    // время бара ложного пробоя
+   double   level;      // ключевой уровень (HH или LL)
+   double   tail;       // длина хвоста пробоя — нужна для SL
+   double   atrAtSig;   // ATR на баре пробоя
+   bool     ltfAgree;   // согласие LTF-тренда на момент пробоя
+   bool     htfAgree;   // согласие HTF-фильтра на момент пробоя
+   int      ltfTrend;   // LTF trend на момент пробоя (для лога)
+   bool     evasive;    // флаг ухода на момент пробоя (для лога)
+  };
+FBGPending  g_pendingBuy;
+FBGPending  g_pendingSell;
+
+//--- (v2.04 #20) счётчики событий за день для бейджа
+struct DayStats { int stFlips; int fbgBuy; int fbgSell; int counter; datetime day; };
+DayStats    g_dayStats;
 
 //--- имя графического объекта-бейджа HTF
 const string HTF_BADGE_NAME = "EvST_FBG_HTF_Badge";
@@ -349,7 +442,8 @@ bool HTFAllows(const datetime t, const int side)
   }
 
 //+------------------------------------------------------------------+
-//| (правка #9 + v2.03 #13) Создать/обновить бейдж со статусом HTF   |
+//| (правка #9 + v2.03 #13 + v2.04 #20)                              |
+//|   Создать/обновить бейдж со статусом HTF + опц. дневная стат.    |
 //+------------------------------------------------------------------+
 void UpdateHTFBadge(const datetime barTime, const int ltfTrend, const bool evasive)
   {
@@ -373,6 +467,14 @@ void UpdateHTFBadge(const datetime barTime, const int ltfTrend, const bool evasi
       string ltfTxt = (ltfTrend > 0) ? "Up" : (ltfTrend < 0) ? "Dn" : "--";
       txt += "  |  LTF " + TfLabel((ENUM_TIMEFRAMES)_Period) + ": " + ltfTxt;
       if(evasive) txt += " (evasive)";
+     }
+
+   //--- (v2.04 #20) счётчики событий за день
+   if(InpHtfBadgeStats)
+     {
+      txt += StringFormat("  |  ST:%d  Buy:%d  Sell:%d  X:%d",
+                          g_dayStats.stFlips, g_dayStats.fbgBuy,
+                          g_dayStats.fbgSell, g_dayStats.counter);
      }
 
    if(ObjectFind(0, HTF_BADGE_NAME) < 0)
@@ -419,17 +521,25 @@ int OnInit()
    //--- (v2.03) уровни Герчика
    SetIndexBuffer(16, BufFBGHigh,      INDICATOR_DATA);
    SetIndexBuffer(17, BufFBGLow,       INDICATOR_DATA);
+   //--- (v2.04) маркеры SL/TP
+   SetIndexBuffer(18, BufFBGSL,        INDICATOR_DATA);
+   SetIndexBuffer(19, BufFBGTP1,       INDICATOR_DATA);
+   SetIndexBuffer(20, BufFBGTP2,       INDICATOR_DATA);
    //--- служебные расчётные буферы
-   SetIndexBuffer(18, BufTrend,        INDICATOR_CALCULATIONS);
-   SetIndexBuffer(19, BufFU,           INDICATOR_CALCULATIONS);
-   SetIndexBuffer(20, BufFL,           INDICATOR_CALCULATIONS);
-   SetIndexBuffer(21, BufEvasive,      INDICATOR_CALCULATIONS);
+   SetIndexBuffer(21, BufTrend,        INDICATOR_CALCULATIONS);
+   SetIndexBuffer(22, BufFU,           INDICATOR_CALCULATIONS);
+   SetIndexBuffer(23, BufFL,           INDICATOR_CALCULATIONS);
+   SetIndexBuffer(24, BufEvasive,      INDICATOR_CALCULATIONS);
 
    PlotIndexSetInteger(2, PLOT_ARROW, InpArrowBuyCode);
    PlotIndexSetInteger(3, PLOT_ARROW, InpArrowSellCode);
    PlotIndexSetInteger(5, PLOT_ARROW, InpFBGArrowBuy);
    PlotIndexSetInteger(6, PLOT_ARROW, InpFBGArrowSell);
    PlotIndexSetInteger(7, PLOT_ARROW, InpCounterCrossCode);
+   //--- (v2.04) маркеры SL/TP
+   PlotIndexSetInteger(11, PLOT_ARROW, InpSLArrowCode);
+   PlotIndexSetInteger(12, PLOT_ARROW, InpTPArrowCode);
+   PlotIndexSetInteger(13, PLOT_ARROW, InpTPArrowCode);
 
    //--- (правка #2) для линий/стрелок «пусто» = EMPTY_VALUE,
    //    для DRAW_COLOR_CANDLES (plot 4) — 0.0
@@ -445,6 +555,10 @@ int OnInit()
    PlotIndexSetDouble(8,  PLOT_EMPTY_VALUE, EMPTY_VALUE);
    PlotIndexSetDouble(9,  PLOT_EMPTY_VALUE, EMPTY_VALUE);
    PlotIndexSetDouble(10, PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   //--- (v2.04) маркеры SL/TP1/TP2
+   PlotIndexSetDouble(11, PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   PlotIndexSetDouble(12, PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   PlotIndexSetDouble(13, PLOT_EMPTY_VALUE, EMPTY_VALUE);
 
    if(!InpColorCandles)
       PlotIndexSetInteger(4, PLOT_DRAW_TYPE, DRAW_NONE);
@@ -460,6 +574,9 @@ int OnInit()
       PlotIndexSetInteger(7,  PLOT_DRAW_TYPE, DRAW_NONE);
       PlotIndexSetInteger(9,  PLOT_DRAW_TYPE, DRAW_NONE);
       PlotIndexSetInteger(10, PLOT_DRAW_TYPE, DRAW_NONE);
+      PlotIndexSetInteger(11, PLOT_DRAW_TYPE, DRAW_NONE);
+      PlotIndexSetInteger(12, PLOT_DRAW_TYPE, DRAW_NONE);
+      PlotIndexSetInteger(13, PLOT_DRAW_TYPE, DRAW_NONE);
      }
    else if(!InpDrawCounterCross)
       PlotIndexSetInteger(7, PLOT_DRAW_TYPE, DRAW_NONE);
@@ -474,18 +591,45 @@ int OnInit()
    if(!InpUseHTF || !InpDrawHtfST)
       PlotIndexSetInteger(8, PLOT_DRAW_TYPE, DRAW_NONE);
 
+   //--- (v2.04 #19) маркеры SL/TP отключаем, если не запрошены
+   if(InpFBGEnabled && !InpDrawSLTP)
+     {
+      PlotIndexSetInteger(11, PLOT_DRAW_TYPE, DRAW_NONE);
+      PlotIndexSetInteger(12, PLOT_DRAW_TYPE, DRAW_NONE);
+      PlotIndexSetInteger(13, PLOT_DRAW_TYPE, DRAW_NONE);
+     }
+
    IndicatorSetString(INDICATOR_SHORTNAME,
-      StringFormat("СуперТренд+Герчик (ATR=%d, x%.2f, шум=%.2f, расш=%.2f%s%s%s)",
+      StringFormat("СуперТренд+Герчик v2.04 (ATR=%d, x%.2f, шум=%.2f, расш=%.2f%s%s%s%s%s)",
          InpAtrLength, InpBaseMultiplier, InpNoiseThreshold, InpExpansionAlpha,
          InpAdaptive       ? ", адаптив" : "",
          InpUseHTF         ? StringFormat(", стТФ=%s", TfLabel(InpHTF)) : "",
-         InpFBGEnabled     ? (InpOnlyWithTrend ? ", Герчик-по тренду" : ", Герчик-все") : ""));
+         InpFBGEnabled     ? (InpOnlyWithTrend ? ", Герчик-по тренду" : ", Герчик-все") : "",
+         InpFBGRequireRetest ? ", ретест" : "",
+         InpFBGUseVolume     ? StringFormat(", vol×%.2f", InpFBGMinVolMult) : ""));
 
    g_htfLastUpdate     = 0;
    g_htfCursor         = 0;
    g_lastSTAlertTime   = 0;
    g_lastFBGAlertTime  = 0;
    g_lastCrossAlertTime= 0;
+
+   //--- (v2.04) сброс состояний
+   g_lastBuyBar  = -1;
+   g_lastSellBar = -1;
+   g_pendingBuy.active  = false;
+   g_pendingSell.active = false;
+   g_dayStats.stFlips = 0;
+   g_dayStats.fbgBuy  = 0;
+   g_dayStats.fbgSell = 0;
+   g_dayStats.counter = 0;
+   g_dayStats.day     = 0;
+   //--- (v2.04 #21) обнулим инкрементальное состояние HTF
+   g_htfPrevUpper = 0.0;
+   g_htfPrevLower = 0.0;
+   g_htfAtr       = 0.0;
+   g_htfAtrSum    = 0.0;
+   g_htfTrend     = 1;
 
    //--- (v2.03 #12) открываем CSV-журнал, если включён
    OpenLogFile();
@@ -603,6 +747,7 @@ void ComputeATR(const int rates_total,
 //+------------------------------------------------------------------+
 //| Пересчёт кэша тренда на старшем ТФ (обычный SuperTrend)          |
 //| (правка #5) — корректный SMA-сид ATR на первых p барах           |
+//| (v2.04 #21) — инкрементальная достройка хвоста при апдейте       |
 //+------------------------------------------------------------------+
 void RebuildHTFTrend()
   {
@@ -617,10 +762,69 @@ void RebuildHTFTrend()
    int copied = CopyRates(_Symbol, InpHTF, 0, want, r);
    if(copied < 5) return;
 
+   int    p       = (InpHtfAtrPeriod < 1) ? 1 : InpHtfAtrPeriod;
+   int    cached  = ArraySize(g_htf);
+
+   //--- (v2.04 #21) пытаемся достроить хвост: если в кэше есть бары,
+   //    последний кэшированный бар совпадает по времени с одним из
+   //    текущих, а перед ним хотя бы p баров истории прогрето,
+   //    продолжаем расчёт с него. Иначе — полный пересбор.
+   int startIdx = -1;
+   if(cached > 0 && cached >= p + 1)
+     {
+      datetime lastCachedT = g_htf[cached - 1].time;
+      // ищем lastCachedT в новой выборке (обычно близко к concу, но
+      // история могла подгрузить старые бары — массив r растёт назад).
+      for(int j = copied - 1; j >= 0; --j)
+        {
+         if(r[j].time == lastCachedT) { startIdx = j; break; }
+         if(r[j].time < lastCachedT) break; // дальше точно не найдём
+        }
+     }
+
+   if(startIdx >= 0 && startIdx + 1 < copied)
+     {
+      //--- инкрементальная достройка работает только в типичном случае,
+      //    когда массив r вырос строго в КОНЕЦ (новые бары добавлены).
+      //    Тогда startIdx == cached - 1 — последний кэшированный бар стоит
+      //    на той же позиции в r. Иначе откатываемся к полному пересбору,
+      //    чтобы не оставлять «дыр» в кэше.
+      if(startIdx == cached - 1)
+        {
+         ArrayResize(g_htf, copied);
+         //--- продолжаем с сохранённого состояния
+         for(int i = startIdx + 1; i < copied; ++i)
+           {
+            g_htf[i].time = r[i].time;
+            double tr = TrueRange(r[i].high, r[i].low, r[i-1].close);
+            // Уайлдер; SMA-сид сюда уже не попадёт, т.к. cached >= p+1
+            g_htfAtr = (g_htfAtr * (p - 1.0) + tr) / p;
+
+            double hl2 = (r[i].high + r[i].low) * 0.5;
+            double bu  = hl2 + InpHtfMultiplier * g_htfAtr;
+            double bl  = hl2 - InpHtfMultiplier * g_htfAtr;
+            double fu  = (bu < g_htfPrevUpper || r[i-1].close > g_htfPrevUpper) ? bu : g_htfPrevUpper;
+            double fl  = (bl > g_htfPrevLower || r[i-1].close < g_htfPrevLower) ? bl : g_htfPrevLower;
+
+            if(g_htfTrend == 1)  g_htfTrend = (r[i].close < fl) ? -1 :  1;
+            else                 g_htfTrend = (r[i].close > fu) ?  1 : -1;
+
+            g_htf[i].trend = g_htfTrend;
+            g_htf[i].st    = (g_htfTrend == 1) ? fl : fu;
+            g_htf[i].col   = (g_htfTrend == 1) ? 0  : 1;
+            g_htfPrevUpper = fu;
+            g_htfPrevLower = fl;
+           }
+         g_htfLastUpdate = lastHTFBar;
+         g_htfCursor     = 0;
+         return;
+        }
+     }
+
+   //--- полный пересбор (первый запуск или history refresh)
    ArrayResize(g_htf, copied);
    double atr=0.0, prevUpper=0.0, prevLower=0.0;
    double sumTr = 0.0;
-   int    p = (InpHtfAtrPeriod < 1) ? 1 : InpHtfAtrPeriod;
    int trend = 1;
    g_htf[0].time = r[0].time; g_htf[0].trend = trend;
    g_htf[0].st   = 0.0;       g_htf[0].col   = 0;
@@ -655,6 +859,15 @@ void RebuildHTFTrend()
       g_htf[i].col   = (trend == 1) ? 0  : 1;
       prevUpper = fu; prevLower = fl;
      }
+
+   //--- (v2.04 #21) фиксируем последнее состояние, чтобы в следующий
+   //    раз можно было достроить хвост инкрементально
+   g_htfPrevUpper = prevUpper;
+   g_htfPrevLower = prevLower;
+   g_htfAtr       = atr;
+   g_htfAtrSum    = sumTr;
+   g_htfTrend     = trend;
+
    g_htfLastUpdate = lastHTFBar;
    //--- (v2.03 #14) сбрасываем курсор поиска: массив пересобран
    g_htfCursor = 0;
@@ -796,6 +1009,341 @@ void FireAlert(const string msg)
   }
 
 //+------------------------------------------------------------------+
+//| (v2.04 #20) Сброс дневной статистики при смене даты              |
+//+------------------------------------------------------------------+
+void RollDayStats(const datetime t)
+  {
+   MqlDateTime sdt;
+   TimeToStruct(t, sdt);
+   sdt.hour = 0; sdt.min = 0; sdt.sec = 0;
+   datetime curDay = StructToTime(sdt);
+   if(curDay != g_dayStats.day)
+     {
+      g_dayStats.day     = curDay;
+      g_dayStats.stFlips = 0;
+      g_dayStats.fbgBuy  = 0;
+      g_dayStats.fbgSell = 0;
+      g_dayStats.counter = 0;
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| (v2.04 #19) Отрисовка маркеров SL/TP1/TP2 для FBG-сигнала        |
+//|   side=+1 покупка, -1 продажа; level — пробитый уровень;         |
+//|   tail — длина хвоста пробоя; entry — цена закрытия бара сигнала.|
+//+------------------------------------------------------------------+
+void DrawSLTP(const int i, const int side, const double entry,
+              const double level, const double tail, const double atr)
+  {
+   if(!InpDrawSLTP || atr <= 0.0) return;
+   //--- SL: за крайней точкой хвоста + буфер. У сигнала на ПОКУПКУ
+   //    хвост уходит ВНИЗ от ll, у ПРОДАЖИ — ВВЕРХ от lh.
+   double sl, tp1, tp2;
+   if(side == 1)
+     {
+      sl  = level - tail - atr * InpFBGSLBufferATR;
+      tp1 = entry + atr * InpFBGTP1ATR;
+      tp2 = entry + atr * InpFBGTP2ATR;
+     }
+   else
+     {
+      sl  = level + tail + atr * InpFBGSLBufferATR;
+      tp1 = entry - atr * InpFBGTP1ATR;
+      tp2 = entry - atr * InpFBGTP2ATR;
+     }
+   BufFBGSL[i]  = sl;
+   BufFBGTP1[i] = tp1;
+   BufFBGTP2[i] = tp2;
+  }
+
+//+------------------------------------------------------------------+
+//| (v2.04 #17) Среднее значение тик-объёма по окну Lookback         |
+//|   Окно — те же N баров, что и для уровней Герчика, ДО бара i.    |
+//+------------------------------------------------------------------+
+double AvgTickVolume(const int i, const long &tick_volume[], const int n)
+  {
+   if(n <= 0 || i - n < 0) return 0.0;
+   double s = 0.0;
+   for(int k = 1; k <= n; ++k) s += (double)tick_volume[i - k];
+   return s / n;
+  }
+
+//+------------------------------------------------------------------+
+//| (v2.04 #22) Блок ложного пробоя по Герчику — отдельной функцией. |
+//|   Возвращает true, если сигнал был отрисован/отлогирован, и      |
+//|   обновляет состояние pending/cooldown/stats.                    |
+//+------------------------------------------------------------------+
+//--- forward declaration: EmitFBG определена ниже
+bool EmitFBG(const int i, const int side,
+             const int alertBarIdx, const bool firstPass,
+             const datetime &time[],
+             const double &close[],
+             const double &low[],
+             const double &high[],
+             const double level, const double tail, const double atr,
+             const bool ltfAgree, const bool htfAgree,
+             const int ltfTrend, const bool evasive,
+             const double fbgOffset);
+
+void ProcessFBG(const int i,
+                const int rates_total,
+                const int alertBarIdx,
+                const bool firstPass,
+                const datetime &time[],
+                const double &open[],
+                const double &high[],
+                const double &low[],
+                const double &close[],
+                const long &tick_volume[],
+                const int trend,
+                const bool evasive,
+                const double atr,
+                const double fbgOffset)
+  {
+   //--- очистка буферов FBG на этом баре
+   BufFBGBuy[i]   = EMPTY_VALUE;
+   BufFBGSell[i]  = EMPTY_VALUE;
+   BufFBGCross[i] = EMPTY_VALUE;
+   BufFBGSL[i]    = EMPTY_VALUE;
+   BufFBGTP1[i]   = EMPTY_VALUE;
+   BufFBGTP2[i]   = EMPTY_VALUE;
+
+   //--- только закрытые бары
+   if(!InpFBGEnabled || i >= rates_total - 1) return;
+
+   double lh = 0, ll = 0;
+   if(!GetFBGLevels(i, time, high, low, lh, ll))
+     {
+      // даже если уровней нет, попробуем закрыть pending по таймауту
+      if(InpFBGRequireRetest)
+        {
+         if(g_pendingBuy.active  && i - g_pendingBuy.sigBar  > InpFBGRetestBars) g_pendingBuy.active  = false;
+         if(g_pendingSell.active && i - g_pendingSell.sigBar > InpFBGRetestBars) g_pendingSell.active = false;
+        }
+      return;
+     }
+
+   //--- (v2.03 #10) рисуем уровни HH/LL Герчика
+   if(InpDrawFBGLevels)
+     {
+      BufFBGHigh[i] = lh;
+      BufFBGLow[i]  = ll;
+     }
+
+   double body = MathAbs(close[i] - open[i]);
+   double mid  = (high[i] + low[i]) * 0.5;
+
+   bool isSell = false, isBuy = false;
+   double sellTail = 0.0, buyTail = 0.0;
+
+   //--- ПРОДАЖА: ложный пробой сопротивления
+   if(lh > 0.0 && high[i] > lh && close[i] < lh && close[i] < mid)
+     {
+      sellTail = high[i] - lh;
+      if(InpFBGMinTailATR <= 0.0 || atr <= 0.0 || sellTail >= atr * InpFBGMinTailATR)
+         isSell = true;
+     }
+   //--- ПОКУПКА: ложный пробой поддержки
+   if(ll > 0.0 && low[i] < ll && close[i] > ll && close[i] > mid)
+     {
+      buyTail = ll - low[i];
+      if(InpFBGMinTailATR <= 0.0 || atr <= 0.0 || buyTail >= atr * InpFBGMinTailATR)
+         isBuy = true;
+     }
+
+   //--- (v2.04 #18) обработка ожидающего ретест BUY
+   if(InpFBGRequireRetest && g_pendingBuy.active)
+     {
+      if(i - g_pendingBuy.sigBar > InpFBGRetestBars)
+         g_pendingBuy.active = false;
+      else if(i > g_pendingBuy.sigBar)
+        {
+         // ретест поддержки снизу не нужен — здесь обратное:
+         // после ложного пробоя поддержки цена должна снова коснуться
+         // уровня ll сверху и закрыться выше него (откат к уровню).
+         bool touched   = (low[i] <= g_pendingBuy.level);
+         bool closedAbove = (close[i] > g_pendingBuy.level);
+         if(touched && closedAbove)
+           {
+            // выводим сигнал на ТЕКУЩЕМ баре подтверждения
+            EmitFBG(i, +1, alertBarIdx, firstPass,
+                    time, close, low, high,
+                    g_pendingBuy.level, g_pendingBuy.tail,
+                    g_pendingBuy.atrAtSig,
+                    g_pendingBuy.ltfAgree, g_pendingBuy.htfAgree,
+                    g_pendingBuy.ltfTrend, g_pendingBuy.evasive,
+                    fbgOffset);
+            g_pendingBuy.active = false;
+           }
+        }
+     }
+   //--- (v2.04 #18) обработка ожидающего ретест SELL
+   if(InpFBGRequireRetest && g_pendingSell.active)
+     {
+      if(i - g_pendingSell.sigBar > InpFBGRetestBars)
+         g_pendingSell.active = false;
+      else if(i > g_pendingSell.sigBar)
+        {
+         bool touched     = (high[i] >= g_pendingSell.level);
+         bool closedBelow = (close[i] < g_pendingSell.level);
+         if(touched && closedBelow)
+           {
+            EmitFBG(i, -1, alertBarIdx, firstPass,
+                    time, close, low, high,
+                    g_pendingSell.level, g_pendingSell.tail,
+                    g_pendingSell.atrAtSig,
+                    g_pendingSell.ltfAgree, g_pendingSell.htfAgree,
+                    g_pendingSell.ltfTrend, g_pendingSell.evasive,
+                    fbgOffset);
+            g_pendingSell.active = false;
+           }
+        }
+     }
+
+   if(!isSell && !isBuy) return;
+
+   //--- (v2.04 #17) объёмный фильтр пробоя
+   if(InpFBGUseVolume && InpFBGMinVolMult > 0.0)
+     {
+      double avgV = AvgTickVolume(i, tick_volume, InpFBGLookback);
+      if(avgV > 0.0)
+        {
+         double curV = (double)tick_volume[i];
+         if(curV < avgV * InpFBGMinVolMult)
+           {
+            // пробой слабый по объёму — игнорируем
+            isBuy = false; isSell = false;
+            return;
+           }
+        }
+     }
+
+   //--- фильтр чрезмерно импульсного бара (ниже — для стрелок;
+   //    крест от него не зависит, как и в v2.03)
+   bool bodyOk = !(InpFBGMaxBodyATR > 0.0 && atr > 0.0 && body > atr * InpFBGMaxBodyATR);
+
+   int  sigSide   = isBuy ? 1 : -1;
+   bool ltfAgree  = (sigSide == trend);
+   bool htfAgree  = HTFAllows(time[i], sigSide);
+   bool withTrend = ltfAgree && htfAgree;
+
+   if(withTrend && bodyOk)
+     {
+      //--- (v2.04 #18) если включён ретест — кладём сигнал в pending,
+      //    стрелка появится только на баре подтверждения
+      if(InpFBGRequireRetest)
+        {
+         FBGPending pend;
+         pend.active   = true;
+         pend.sigBar   = i;
+         pend.sigTime  = time[i];
+         pend.level    = isBuy ? ll : lh;
+         pend.tail     = isBuy ? buyTail : sellTail;
+         pend.atrAtSig = atr;
+         pend.ltfAgree = ltfAgree;
+         pend.htfAgree = htfAgree;
+         pend.ltfTrend = trend;
+         pend.evasive  = evasive;
+         if(isBuy) g_pendingBuy = pend; else g_pendingSell = pend;
+        }
+      else
+        {
+         EmitFBG(i, sigSide, alertBarIdx, firstPass,
+                 time, close, low, high,
+                 isBuy ? ll : lh,
+                 isBuy ? buyTail : sellTail,
+                 atr, ltfAgree, htfAgree, trend, evasive, fbgOffset);
+        }
+     }
+   else
+     {
+      //--- (правка #4 + #7) если рисуется крест, стрелку не дублируем
+      bool drawCross = InpDrawCounterCross;
+
+      if(!drawCross && !InpOnlyWithTrend && bodyOk)
+        {
+         //--- встречный сигнал, но крест отключён и фильтр снят —
+         //    рисуем «обычную» стрелку с учётом кулдауна
+         EmitFBG(i, sigSide, alertBarIdx, firstPass,
+                 time, close, low, high,
+                 isBuy ? ll : lh, isBuy ? buyTail : sellTail,
+                 atr, ltfAgree, htfAgree, trend, evasive, fbgOffset);
+        }
+
+      if(drawCross)
+        {
+         if(sigSide == 1) BufFBGCross[i] = low[i]  - fbgOffset;
+         else             BufFBGCross[i] = high[i] + fbgOffset;
+
+         if(!firstPass) g_dayStats.counter++;
+
+         if(!firstPass && InpAlertOnCounter && i == alertBarIdx
+            && time[i] != g_lastCrossAlertTime)
+           {
+            g_lastCrossAlertTime = time[i];
+            string side  = (sigSide == 1) ? "шорта" : "лонга";
+            string cause = !ltfAgree && !htfAgree ? "LTF+HTF"
+                           : !ltfAgree            ? "LTF"
+                           :                        "HTF";
+            FireAlert(StringFormat("Герчик встречный сигнал против %s [%s] | %s %s @ %s",
+                       side, cause, _Symbol, TfLabel((ENUM_TIMEFRAMES)_Period),
+                       DoubleToString(close[i], _Digits)));
+            if(InpLogCounter)
+               LogSignal(time[i], "FBG_COUNTER", (sigSide == 1) ? "BUY" : "SELL",
+                         close[i], (sigSide == 1) ? ll : lh,
+                         trend, HTFTrendAt(time[i]), evasive, atr);
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| (v2.04 #16) Эмит стрелки FBG с учётом кулдауна, SL/TP, лога.     |
+//|   side=+1 покупка, -1 продажа; level — пробитый уровень.         |
+//|   Возвращает true, если стрелка была отрисована.                 |
+//+------------------------------------------------------------------+
+bool EmitFBG(const int i, const int side,
+             const int alertBarIdx, const bool firstPass,
+             const datetime &time[],
+             const double &close[],
+             const double &low[],
+             const double &high[],
+             const double level, const double tail, const double atr,
+             const bool ltfAgree, const bool htfAgree,
+             const int ltfTrend, const bool evasive,
+             const double fbgOffset)
+  {
+   //--- кулдаун
+   if(InpFBGCooldownBars > 0)
+     {
+      int lastBar = (side == 1) ? g_lastBuyBar : g_lastSellBar;
+      if(lastBar >= 0 && i - lastBar <= InpFBGCooldownBars) return false;
+     }
+
+   if(side == 1) { BufFBGBuy[i]  = low[i]  - fbgOffset; g_lastBuyBar  = i; if(!firstPass) g_dayStats.fbgBuy++;  }
+   else          { BufFBGSell[i] = high[i] + fbgOffset; g_lastSellBar = i; if(!firstPass) g_dayStats.fbgSell++; }
+
+   DrawSLTP(i, side, close[i], level, tail, atr);
+
+   if(!firstPass && InpAlertOnFBG && i == alertBarIdx
+      && time[i] != g_lastFBGAlertTime)
+     {
+      g_lastFBGAlertTime = time[i];
+      string sideStr = (side == 1) ? "ПОКУПКА" : "ПРОДАЖА";
+      string note    = (ltfAgree && htfAgree) ? "(по тренду)" : "(встречный)";
+      FireAlert(StringFormat("Герчик %s %s | %s %s @ %s | уровень %s",
+                 sideStr, note, _Symbol, TfLabel((ENUM_TIMEFRAMES)_Period),
+                 DoubleToString(close[i], _Digits),
+                 DoubleToString(level, _Digits)));
+      if(InpLogFBG)
+         LogSignal(time[i], "FBG", (side == 1) ? "BUY" : "SELL",
+                   close[i], level,
+                   ltfTrend, HTFTrendAt(time[i]), evasive, atr);
+     }
+   return true;
+  }
+
+//+------------------------------------------------------------------+
 //| Основной расчёт                                                  |
 //+------------------------------------------------------------------+
 int OnCalculate(const int rates_total,
@@ -837,10 +1385,19 @@ int OnCalculate(const int rates_total,
       ArrayInitialize(BufHtfSTCol,     0);
       ArrayInitialize(BufFBGHigh,      EMPTY_VALUE);
       ArrayInitialize(BufFBGLow,       EMPTY_VALUE);
+      //--- (v2.04) маркеры SL/TP
+      ArrayInitialize(BufFBGSL,        EMPTY_VALUE);
+      ArrayInitialize(BufFBGTP1,       EMPTY_VALUE);
+      ArrayInitialize(BufFBGTP2,       EMPTY_VALUE);
       ArrayInitialize(BufTrend,        1);
       ArrayInitialize(BufFU,           0);
       ArrayInitialize(BufFL,           0);
       ArrayInitialize(BufEvasive,      0);
+      //--- (v2.04) на полный пересчёт сбрасываем pending и кулдаун
+      g_lastBuyBar  = -1;
+      g_lastSellBar = -1;
+      g_pendingBuy.active  = false;
+      g_pendingSell.active = false;
       start = 1;
      }
    else
@@ -939,123 +1496,9 @@ int OnCalculate(const int rates_total,
         }
 
       //================ Блок ложного пробоя по Герчику =============
-      BufFBGBuy[i]   = EMPTY_VALUE;
-      BufFBGSell[i]  = EMPTY_VALUE;
-      BufFBGCross[i] = EMPTY_VALUE;
-
-      // только закрытые бары
-      if(!InpFBGEnabled || i >= rates_total - 1) continue;
-
-      double lh = 0, ll = 0;
-      if(!GetFBGLevels(i, time, high, low, lh, ll)) continue;
-
-      //--- (v2.03 #10) рисуем уровни HH/LL Герчика
-      if(InpDrawFBGLevels)
-        {
-         BufFBGHigh[i] = lh;
-         BufFBGLow[i]  = ll;
-        }
-
-      double body = MathAbs(close[i] - open[i]);
-      double mid  = (high[i] + low[i]) * 0.5;
-
-      bool isSell = false, isBuy = false;
-
-      // ПРОДАЖА: ложный пробой сопротивления
-      if(lh > 0.0 && high[i] > lh && close[i] < lh && close[i] < mid)
-        {
-         double tail = high[i] - lh;
-         if(InpFBGMinTailATR <= 0.0 || atr <= 0.0 || tail >= atr * InpFBGMinTailATR)
-            isSell = true;
-        }
-      // ПОКУПКА: ложный пробой поддержки
-      if(ll > 0.0 && low[i] < ll && close[i] > ll && close[i] > mid)
-        {
-         double tail = ll - low[i];
-         if(InpFBGMinTailATR <= 0.0 || atr <= 0.0 || tail >= atr * InpFBGMinTailATR)
-            isBuy = true;
-        }
-
-      if(!isSell && !isBuy) continue;
-
-      // фильтр чрезмерно импульсного бара — применяем только к стрелкам-сигналам.
-      // Крест на встречном сигнале рисуем независимо от этого фильтра, чтобы
-      // не терять предупреждение об ослаблении тренда на больших барах.
-      bool bodyOk = !(InpFBGMaxBodyATR > 0.0 && atr > 0.0 && body > atr * InpFBGMaxBodyATR);
-
-      //--- (правка #7) фильтр по тренду: учитываем И LTF-ST, И HTF-ST.
-      //    sigSide = +1 для бычьего сигнала FBG, -1 для медвежьего.
-      int  sigSide   = isBuy ? 1 : -1;
-      bool ltfAgree  = (sigSide == trend);
-      bool htfAgree  = HTFAllows(time[i], sigSide);
-      bool withTrend = ltfAgree && htfAgree;          // согласие везде
-      // counterTrend ⇔ есть противоречие на любом уровне
-      // (ltf против ИЛИ htf против). Это и есть «раннее предупреждение
-      //  ослабления тренда» — чем мы и хотели насытить крест.
-
-      if(withTrend && bodyOk)
-        {
-         if(isBuy)  BufFBGBuy[i]  = low[i]  - fbgOffset;
-         if(isSell) BufFBGSell[i] = high[i] + fbgOffset;
-
-         if(!firstPass && InpAlertOnFBG && i == alertBarIdx
-            && time[i] != g_lastFBGAlertTime)
-           {
-            g_lastFBGAlertTime = time[i];
-            string side = isBuy ? "ПОКУПКА" : "ПРОДАЖА";
-            FireAlert(StringFormat("Герчик %s (по тренду) | %s %s @ %s | уровень %s",
-                       side, _Symbol, TfLabel((ENUM_TIMEFRAMES)_Period),
-                       DoubleToString(close[i], _Digits),
-                       DoubleToString(isBuy ? ll : lh, _Digits)));
-            //--- (v2.03 #12) CSV-лог сигнала FBG (по тренду)
-            if(InpLogFBG)
-               LogSignal(time[i], "FBG", isBuy ? "BUY" : "SELL",
-                         close[i], (isBuy ? ll : lh),
-                         trend, HTFTrendAt(time[i]), evasive, atr);
-           }
-        }
-      else
-        {
-         //--- (правка #4 + #7) если будем рисовать встречный крест,
-         //    стрелку Герчика на этом же баре НЕ рисуем — они визуально
-         //    налезают. Стрелка остаётся только когда крест отключён,
-         //    а фильтр «только по тренду» — снят.
-         bool drawCross = InpDrawCounterCross;
-
-         if(!drawCross && !InpOnlyWithTrend && bodyOk)
-           {
-            if(isBuy)  BufFBGBuy[i]  = low[i]  - fbgOffset;
-            if(isSell) BufFBGSell[i] = high[i] + fbgOffset;
-           }
-
-         if(drawCross)
-           {
-            //--- позиция креста: над high для встречи лонгу,
-            //    под low — для встречи шорту. Привязка идёт к тому,
-            //    КУДА смотрит сам сигнал FBG (sigSide), а не к LTF-trend,
-            //    потому что HTF мог развернуться раньше LTF.
-            if(sigSide == 1) BufFBGCross[i] = low[i]  - fbgOffset; // встречный лонг → крест под low
-            else             BufFBGCross[i] = high[i] + fbgOffset; // встречный шорт → крест над high
-
-            if(!firstPass && InpAlertOnCounter && i == alertBarIdx
-               && time[i] != g_lastCrossAlertTime)
-              {
-               g_lastCrossAlertTime = time[i];
-               string side  = (sigSide == 1) ? "шорта" : "лонга";
-               string cause = !ltfAgree && !htfAgree ? "LTF+HTF"
-                              : !ltfAgree            ? "LTF"
-                              :                        "HTF";
-               FireAlert(StringFormat("Герчик встречный сигнал против %s [%s] | %s %s @ %s",
-                          side, cause, _Symbol, TfLabel((ENUM_TIMEFRAMES)_Period),
-                          DoubleToString(close[i], _Digits)));
-               //--- (v2.03 #12) CSV-лог встречного креста
-               if(InpLogCounter)
-                  LogSignal(time[i], "FBG_COUNTER", (sigSide == 1) ? "BUY" : "SELL",
-                            close[i], (sigSide == 1) ? ll : lh,
-                            trend, HTFTrendAt(time[i]), evasive, atr);
-              }
-           }
-        }
+      ProcessFBG(i, rates_total, alertBarIdx, firstPass,
+                 time, open, high, low, close, tick_volume,
+                 trend, evasive, atr, fbgOffset);
      }
 
    //--- Одиночное оповещение о флипе СуперТренда (используем тот же alertBarIdx)
@@ -1072,6 +1515,9 @@ int OnCalculate(const int rates_total,
          if(fireBuy || fireSell)
            {
             g_lastSTAlertTime = barT;
+            //--- (v2.04 #20) дневной счётчик флипов
+            RollDayStats(barT);
+            g_dayStats.stFlips++;
             string side = fireBuy ? "БЫЧИЙ" : "МЕДВЕЖИЙ";
             FireAlert(StringFormat("СуперТренд %s флип | %s %s @ %s",
                        side, _Symbol, TfLabel((ENUM_TIMEFRAMES)_Period),
@@ -1085,12 +1531,13 @@ int OnCalculate(const int rates_total,
         }
      }
 
-   //--- (правка #9 + v2.03 #13) обновляем бейдж HTF на каждом расчёте
+   //--- (правка #9 + v2.03 #13 + v2.04 #20) обновляем бейдж HTF
    if(rates_total >= 1)
      {
       int    lastIdx    = rates_total - 1;
       int    lastTrend  = (int)BufTrend[lastIdx];
       bool   lastEvas   = (BufEvasive[lastIdx] > 0.5);
+      RollDayStats(time[lastIdx]); // (v2.04) стат привязана к текущему дню
       UpdateHTFBadge(time[lastIdx], lastTrend, lastEvas);
      }
 
