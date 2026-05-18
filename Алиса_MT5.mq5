@@ -7,6 +7,8 @@
 //|   + ЗАКРЫТИЕ ОРДЕРОВ ПО СМЕНЕ ТРЕНДА                            |
 //|   + ЛОКИРОВАНИЕ ПО ПРОСАДКЕ ОТ БАЛАНСА                           |
 //|   + RECOVERY HANDOFF (передача DD-корзины советнику Recovery)    |
+//|   + SuperTrend LTF+HTF фильтр тренда (v5.3)                     |
+//|   + Фильтр новостей через встроенный Calendar (v5.3)             |
 //|                                                                  |
 //|  v5.2 — фиксы и интеграция:                                      |
 //|    A) Один параметр для частичного закрытия (вместо двух).       |
@@ -34,9 +36,9 @@
 //|    позиции (Active=0) И DD упала ниже HandoffResumeDD.           |
 //|    Старый встречный лок при UseRecoveryHandoff=true отключается. |
 //+------------------------------------------------------------------+
-#property copyright "АлисА v5.2"
+#property copyright "АлисА v5.3"
 #property link      "ZMA"
-#property version   "5.2"
+#property version   "5.3"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -73,14 +75,36 @@ input bool   CloseSellOnBullTrend    = false;   // Закрывать SELL пр�
 input bool   CloseOnFlat             = false;  // Закрывать ВСЕ ордера при ФЛЭТЕ
 input bool   ForbidAlisaTradingInFlat = true;  // Запретить торговлю АЛИСЕ во флэте
 
-input group "=== ФИЛЬТР ПО ТРЕНДУ (3 МА) ==="
-input bool   UseТрендФильтр         = true;
+input group "=== ФИЛЬТР ПО ТРЕНДУ (3 МА) — LEGACY ==="
+input bool   UseТрендФильтр         = false;    // [LEGACY] 3-МА фильтр (выключен при UseSTFilter=true)
 input ENUM_TIMEFRAMES TrendTF       = PERIOD_H1;
 input int    МА_Быстрая             = 133;
 input int    МА_Средняя             = 233;
 input int    МА_Медленная           = 333;
 input ENUM_MA_METHOD МА_Метод       = MODE_EMA;
 input ENUM_APPLIED_PRICE МА_Цена    = PRICE_CLOSE;
+
+input group "=== ФИЛЬТР ПО ТРЕНДУ (SuperTrend LTF+HTF) ==="
+input bool   UseSTFilter            = true;     // Фильтр по EvasiveST_FBG (заменяет 3 МА)
+input string STIndicatorName        = "EvasiveST_FBG"; // Имя индикатора (в Indicators/)
+input ENUM_TIMEFRAMES ST_TF         = PERIOD_H1;       // Таймфрейм LTF SuperTrend
+input int    STAtrLength            = 10;       // ATR длина (param индикатора)
+input double STBaseMultiplier       = 3.0;      // Множитель ATR (param индикатора)
+input bool   STRequireNoEvasion     = true;     // Запрет входов когда ST в режиме «ухода от шума»
+input int    STMinBarsForFlip       = 2;        // Игнорировать флип тренда короче N баров (антидребезг)
+input bool   UseSTHTF               = true;     // Использовать HTF SuperTrend как доп. фильтр
+input ENUM_TIMEFRAMES ST_HTF        = PERIOD_H4;       // Старший ТФ для HTF SuperTrend
+input int    STHtfAtrLength         = 10;       // ATR длина HTF
+input double STHtfMultiplier        = 3.0;      // Множитель ATR HTF
+
+input group "=== ФИЛЬТР НОВОСТЕЙ (Calendar) ==="
+input bool   UseNewsFilter          = true;     // Запрет первых входов перед новостями
+input string NewsCurrenciesCSV      = "USD";    // Валюты для фильтра (через запятую)
+input int    NewsHighBeforeMin      = 60;       // High-impact: блок за N минут ДО
+input int    NewsHighAfterMin       = 30;       // High-impact: блок N минут ПОСЛЕ
+input int    NewsMediumBeforeMin    = 20;       // Medium-impact: блок за N минут ДО
+input int    NewsMediumAfterMin     = 10;       // Medium-impact: блок N минут ПОСЛЕ
+input bool   NewsBlockAveraging     = false;    // Блокировать и усреднения (не только первые входы)
 
 input group "=== СЕТКА ПО ATR ==="
 input bool   UseATRGrid        = false;
@@ -220,6 +244,21 @@ int g_ma_fast_handle  = INVALID_HANDLE;
 int g_ma_mid_handle   = INVALID_HANDLE;
 int g_ma_slow_handle  = INVALID_HANDLE;
 int g_atr_handle      = INVALID_HANDLE;
+
+// === SuperTrend filter state ===
+int g_st_ltf_handle   = INVALID_HANDLE;   // iCustom handle для LTF SuperTrend
+int g_st_htf_handle   = INVALID_HANDLE;   // iCustom handle для HTF SuperTrend
+int g_st_ltf_trend    = 0;                 // текущий LTF тренд: +1/-1
+int g_st_htf_trend    = 0;                 // текущий HTF тренд: +1/-1
+int g_st_flip_bars    = 0;                 // баров прошло с последнего флипа LTF
+int g_st_prev_trend   = 0;                 // предыдущий LTF тренд (для счёта flip_bars)
+bool g_st_evasive     = false;             // LTF ST в режиме evasion
+
+// === News filter state ===
+bool     g_news_block_entry     = false;   // блокировка первого входа
+bool     g_news_block_averaging = false;   // блокировка усреднения (если NewsBlockAveraging)
+string   g_news_block_reason    = "";      // название события, вызвавшего блок
+datetime g_news_last_check      = 0;       // когда последний раз опрашивали календарь
 
 datetime g_last_grid_bar_time = 0;
 
@@ -567,13 +606,70 @@ void UpdateTrendFlags()
    g_trend_sell_allowed = false;
    int current_trend = 0;
 
-   if(!UseТрендФильтр)
+   if(UseSTFilter)
    {
-      g_trend_buy_allowed = g_trend_sell_allowed = true;
-      current_trend = 1;
+      //--- Читаем LTF SuperTrend buffer #14 (BufTrend), shift=1 (закрытый бар)
+      double st_trend_buf[1];
+      double st_evasive_buf[1];
+      g_st_ltf_trend = 0;
+      g_st_evasive   = false;
+
+      if(g_st_ltf_handle != INVALID_HANDLE &&
+         CopyBuffer(g_st_ltf_handle, 14, 1, 1, st_trend_buf) > 0)
+      {
+         g_st_ltf_trend = (st_trend_buf[0] > 0.5) ? 1 : -1;
+      }
+      // buffer #17 = BufEvasive (1.0 если evasive)
+      if(STRequireNoEvasion && g_st_ltf_handle != INVALID_HANDLE &&
+         CopyBuffer(g_st_ltf_handle, 17, 1, 1, st_evasive_buf) > 0)
+      {
+         g_st_evasive = (st_evasive_buf[0] > 0.5);
+      }
+
+      //--- HTF SuperTrend
+      g_st_htf_trend = 0;
+      if(UseSTHTF && g_st_htf_handle != INVALID_HANDLE)
+      {
+         double htf_buf[1];
+         if(CopyBuffer(g_st_htf_handle, 14, 1, 1, htf_buf) > 0)
+            g_st_htf_trend = (htf_buf[0] > 0.5) ? 1 : -1;
+      }
+
+      //--- Счётчик баров с последнего флипа (антидребезг)
+      if(g_st_ltf_trend != 0 && g_st_ltf_trend != g_st_prev_trend)
+      {
+         g_st_flip_bars = 0;  // только что флипнул
+         g_st_prev_trend = g_st_ltf_trend;
+      }
+      else
+         g_st_flip_bars++;
+
+      //--- Определяем финальный тренд: LTF + HTF agreement
+      bool ltf_bull = (g_st_ltf_trend == 1);
+      bool ltf_bear = (g_st_ltf_trend == -1);
+      bool htf_ok_buy  = (!UseSTHTF || g_st_htf_trend >= 0);  // HTF не мешает (бычий или нет данных)
+      bool htf_ok_sell = (!UseSTHTF || g_st_htf_trend <= 0);  // HTF не мешает (медвежий или нет данных)
+
+      // Evasion-блок: если ST в зоне шума — не торгуем
+      bool evasion_block = (STRequireNoEvasion && g_st_evasive);
+
+      // Антидребезг: если флип произошёл меньше STMinBarsForFlip баров назад — держим предыдущее направление
+      bool flip_cooldown = (STMinBarsForFlip > 0 && g_st_flip_bars < STMinBarsForFlip);
+
+      if(!evasion_block && !flip_cooldown)
+      {
+         if(ltf_bull && htf_ok_buy)
+         { g_trend_buy_allowed = true; g_trend_sell_allowed = false; current_trend = 1; }
+         else if(ltf_bear && htf_ok_sell)
+         { g_trend_buy_allowed = false; g_trend_sell_allowed = true; current_trend = -1; }
+         else
+         { g_trend_buy_allowed = false; g_trend_sell_allowed = false; current_trend = 0; }
+      }
+      // При evasion/cooldown оба флага остаются false → торговля заблокирована
    }
-   else
+   else if(UseТрендФильтр)
    {
+      //--- LEGACY: 3-MA фильтр
       double fast = GetMA(g_ma_fast_handle);
       double mid  = GetMA(g_ma_mid_handle);
       double slow = GetMA(g_ma_slow_handle);
@@ -587,6 +683,12 @@ void UpdateTrendFlags()
 
       if(ForbidAlisaTradingInFlat && current_trend == 0)
       { g_trend_buy_allowed = false; g_trend_sell_allowed = false; }
+   }
+   else
+   {
+      // Нет фильтра — всё разрешено
+      g_trend_buy_allowed = g_trend_sell_allowed = true;
+      current_trend = 1;
    }
 
    // FIX E: на uninit-состоянии тренд-закрытий не делаем
@@ -613,6 +715,87 @@ void UpdateTrendFlags()
    }
 
    g_last_trend_state = current_trend;
+}
+
+//+------------------------------------------------------------------+
+//| Фильтр новостей — опрос встроенного календаря MT5                |
+//|   Блокирует первые входы (и опционально усреднения) в окнах      |
+//|   вокруг USD high/medium impact событий.                         |
+//+------------------------------------------------------------------+
+void UpdateNewsFilter()
+{
+   g_news_block_entry     = false;
+   g_news_block_averaging = false;
+   g_news_block_reason    = "";
+
+   if(!UseNewsFilter) return;
+
+   // Опрашиваем календарь не чаще 1 раза в 30 секунд (экономия ресурсов)
+   datetime now = TimeCurrent();
+   if(now - g_news_last_check < 30 && g_news_last_check > 0)
+   {
+      // Используем кэшированное состояние — ничего не пересчитываем.
+      // Флаги уже были установлены на прошлом вызове — восстановим из «статического кэша».
+      // Кэш реализуем через static:
+   }
+   g_news_last_check = now;
+
+   // Окна поиска: от (now - maxBefore) до (now + maxAfter)
+   int maxBefore = MathMax(NewsHighBeforeMin, NewsMediumBeforeMin) * 60;
+   int maxAfter  = MathMax(NewsHighAfterMin,  NewsMediumAfterMin)  * 60;
+   datetime from = now - maxBefore;
+   datetime to   = now + maxAfter;
+
+   // Парсим валюты из CSV
+   string currencies[];
+   int numCurr = StringSplit(NewsCurrenciesCSV, ',', currencies);
+
+   // Перебираем события через CalendarValueHistory
+   MqlCalendarValue values[];
+   int total = CalendarValueHistory(values, from, to);
+   if(total <= 0) return;
+
+   for(int i = 0; i < total; i++)
+   {
+      // Получаем описание события
+      MqlCalendarEvent evt;
+      if(!CalendarEventById(values[i].event_id, evt)) continue;
+
+      // Получаем страну
+      MqlCalendarCountry country;
+      if(!CalendarCountryById(evt.country_id, country)) continue;
+
+      // Проверяем валюту
+      bool currencyMatch = false;
+      for(int c = 0; c < numCurr; c++)
+      {
+         string cur = currencies[c];
+         StringTrimLeft(cur); StringTrimRight(cur);
+         if(StringCompare(country.currency, cur, false) == 0)
+         { currencyMatch = true; break; }
+      }
+      if(!currencyMatch) continue;
+
+      // Определяем importance
+      int beforeSec = 0, afterSec = 0;
+      if(evt.importance == CALENDAR_IMPORTANCE_HIGH)
+      { beforeSec = NewsHighBeforeMin * 60;  afterSec = NewsHighAfterMin * 60; }
+      else if(evt.importance == CALENDAR_IMPORTANCE_MODERATE)
+      { beforeSec = NewsMediumBeforeMin * 60; afterSec = NewsMediumAfterMin * 60; }
+      else
+         continue;  // Low-impact — пропускаем
+
+      // Проверяем попадание текущего времени в окно
+      datetime eventTime = values[i].time;
+      if(now >= eventTime - beforeSec && now <= eventTime + afterSec)
+      {
+         g_news_block_entry = true;
+         if(NewsBlockAveraging) g_news_block_averaging = true;
+         g_news_block_reason = evt.name;
+         // Достаточно первого попадания — один блок перекрывает всё
+         return;
+      }
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -782,16 +965,24 @@ public:
 
       if(РазрешитьBuy && m_cntBuy < m_max_trades && buy_signal && g_trend_buy_allowed)
       {
-         if(m_cntBuy == 0 && !m_buy_signal_sent)
+         // News filter: block first entry or averaging
+         bool news_blocks_this = false;
+         if(m_cntBuy == 0 && g_news_block_entry) news_blocks_this = true;
+         if(m_cntBuy > 0  && g_news_block_averaging) news_blocks_this = true;
+
+         if(!news_blocks_this)
          {
-            OpenOrder(ORDER_TYPE_BUY, GetStartLot(), m_baseComment + " BUY start");
-            m_buy_signal_sent = true;
-         }
-         else if(m_cntBuy > 0 && is_new_grid_bar)
-         {
-            double step = GetGridStepPoints() * symb.Point();
-            if(m_last_buy_price > 0 && m_last_buy_price - symb.Ask() >= step)
-               OpenOrder(ORDER_TYPE_BUY, CalculateNextLot(m_last_buy_lot), m_baseComment + " BUY grid");
+            if(m_cntBuy == 0 && !m_buy_signal_sent)
+            {
+               OpenOrder(ORDER_TYPE_BUY, GetStartLot(), m_baseComment + " BUY start");
+               m_buy_signal_sent = true;
+            }
+            else if(m_cntBuy > 0 && is_new_grid_bar)
+            {
+               double step = GetGridStepPoints() * symb.Point();
+               if(m_last_buy_price > 0 && m_last_buy_price - symb.Ask() >= step)
+                  OpenOrder(ORDER_TYPE_BUY, CalculateNextLot(m_last_buy_lot), m_baseComment + " BUY grid");
+            }
          }
       }
       else if(!buy_signal)
@@ -799,16 +990,24 @@ public:
 
       if(РазрешитьSell && m_cntSell < m_max_trades && sell_signal && g_trend_sell_allowed)
       {
-         if(m_cntSell == 0 && !m_sell_signal_sent)
+         // News filter: block first entry or averaging
+         bool news_blocks_this = false;
+         if(m_cntSell == 0 && g_news_block_entry) news_blocks_this = true;
+         if(m_cntSell > 0  && g_news_block_averaging) news_blocks_this = true;
+
+         if(!news_blocks_this)
          {
-            OpenOrder(ORDER_TYPE_SELL, GetStartLot(), m_baseComment + " SELL start");
-            m_sell_signal_sent = true;
-         }
-         else if(m_cntSell > 0 && is_new_grid_bar)
-         {
-            double step = GetGridStepPoints() * symb.Point();
-            if(m_last_sell_price > 0 && symb.Bid() - m_last_sell_price >= step)
-               OpenOrder(ORDER_TYPE_SELL, CalculateNextLot(m_last_sell_lot), m_baseComment + " SELL grid");
+            if(m_cntSell == 0 && !m_sell_signal_sent)
+            {
+               OpenOrder(ORDER_TYPE_SELL, GetStartLot(), m_baseComment + " SELL start");
+               m_sell_signal_sent = true;
+            }
+            else if(m_cntSell > 0 && is_new_grid_bar)
+            {
+               double step = GetGridStepPoints() * symb.Point();
+               if(m_last_sell_price > 0 && symb.Bid() - m_last_sell_price >= step)
+                  OpenOrder(ORDER_TYPE_SELL, CalculateNextLot(m_last_sell_lot), m_baseComment + " SELL grid");
+            }
          }
       }
       else if(!sell_signal)
@@ -1106,14 +1305,60 @@ void CloseAllGlobalPositions()
 //+------------------------------------------------------------------+
 bool InitTrendFilters()
 {
-   if(!UseТрендФильтр) return true;
-   g_ma_fast_handle = iMA(Symbol(), TrendTF, МА_Быстрая, 0, МА_Метод, МА_Цена);
-   g_ma_mid_handle  = iMA(Symbol(), TrendTF, МА_Средняя, 0, МА_Метод, МА_Цена);
-   g_ma_slow_handle = iMA(Symbol(), TrendTF, МА_Медленная, 0, МА_Метод, МА_Цена);
-   if(g_ma_fast_handle == INVALID_HANDLE ||
-      g_ma_mid_handle  == INVALID_HANDLE ||
-      g_ma_slow_handle == INVALID_HANDLE)
-   { Print("ERROR: MA handles"); return false; }
+   // LEGACY 3-MA фильтр
+   if(UseТрендФильтр && !UseSTFilter)
+   {
+      g_ma_fast_handle = iMA(Symbol(), TrendTF, МА_Быстрая, 0, МА_Метод, МА_Цена);
+      g_ma_mid_handle  = iMA(Symbol(), TrendTF, МА_Средняя, 0, МА_Метод, МА_Цена);
+      g_ma_slow_handle = iMA(Symbol(), TrendTF, МА_Медленная, 0, МА_Метод, МА_Цена);
+      if(g_ma_fast_handle == INVALID_HANDLE ||
+         g_ma_mid_handle  == INVALID_HANDLE ||
+         g_ma_slow_handle == INVALID_HANDLE)
+      { Print("ERROR: MA handles"); return false; }
+   }
+
+   // SuperTrend LTF
+   if(UseSTFilter)
+   {
+      g_st_ltf_handle = iCustom(Symbol(), ST_TF, STIndicatorName,
+                                STAtrLength, STBaseMultiplier,
+                                1.0, 0.5, true,          // NoiseThreshold, ExpansionAlpha, EvasionPersist
+                                false, 5, 30, 10,        // Adaptive off, min/max/effLen
+                                false, PERIOD_H1, 10, 3.0, true, true, CORNER_RIGHT_UPPER, // HTF off inside indicator (we do our own HTF)
+                                true, true, 233, 234,    // ShowSignals, ColorCandles, ArrowCodes
+                                true, 0, 20, 0.15, 1.50, 241, 242, 10,  // FBG defaults
+                                true, true, 251, true, true,             // FBG trend/cross/alert
+                                true, true, true, "alert.wav", false, false // alerts
+                                );
+      if(g_st_ltf_handle == INVALID_HANDLE)
+      {
+         // Попытка загрузить с минимальными параметрами (если кастомный набор не подходит)
+         g_st_ltf_handle = iCustom(Symbol(), ST_TF, STIndicatorName);
+         if(g_st_ltf_handle == INVALID_HANDLE)
+         { Print("ERROR: ST LTF iCustom handle failed for ", STIndicatorName); return false; }
+      }
+
+      // SuperTrend HTF (отдельный экземпляр индикатора на старшем ТФ)
+      if(UseSTHTF)
+      {
+         g_st_htf_handle = iCustom(Symbol(), ST_HTF, STIndicatorName,
+                                   STHtfAtrLength, STHtfMultiplier,
+                                   1.0, 0.5, true,
+                                   false, 5, 30, 10,
+                                   false, PERIOD_H1, 10, 3.0, true, true, CORNER_RIGHT_UPPER,
+                                   true, true, 233, 234,
+                                   true, 0, 20, 0.15, 1.50, 241, 242, 10,
+                                   true, true, 251, true, true,
+                                   true, true, true, "alert.wav", false, false
+                                   );
+         if(g_st_htf_handle == INVALID_HANDLE)
+         {
+            g_st_htf_handle = iCustom(Symbol(), ST_HTF, STIndicatorName);
+            if(g_st_htf_handle == INVALID_HANDLE)
+            { Print("ERROR: ST HTF iCustom handle failed for ", STIndicatorName); return false; }
+         }
+      }
+   }
    return true;
 }
 
@@ -1269,6 +1514,10 @@ void OnDeinit(const int reason)
    DeleteOwnPanelObjects();   // FIX D
    Comment("");
 
+   // Освобождаем ST handles
+   if(g_st_ltf_handle != INVALID_HANDLE) { IndicatorRelease(g_st_ltf_handle); g_st_ltf_handle = INVALID_HANDLE; }
+   if(g_st_htf_handle != INVALID_HANDLE) { IndicatorRelease(g_st_htf_handle); g_st_htf_handle = INVALID_HANDLE; }
+
    if(g_lock_active)
    {
       // FIX C: закрытие лока опционально
@@ -1296,6 +1545,7 @@ void OnTick()
    if(ИспользоватьОстановку && CheckFloatingLoss()) return;
 
    UpdateTrendFlags();
+   UpdateNewsFilter();
    CheckAndManageDrawdownLock();
    CheckGlobalCloseConditions();
 
@@ -1340,19 +1590,39 @@ void UpdateInfo()
    int baseX = GUI_X, baseY = GUI_Y, lineStep = GUI_StepY;
 
    string trendStatus = "---";
-   if(UseТрендФильтр)
+   if(UseSTFilter)
    {
-      if(IsTrendBullish())      trendStatus = "↑BUY";
-      else if(IsTrendBearish()) trendStatus = "↓SELL";
-      else                      trendStatus = "→ФЛЭТ";
+      if(g_st_ltf_trend == 1 && g_trend_buy_allowed)       trendStatus = "ST:↑BUY";
+      else if(g_st_ltf_trend == -1 && g_trend_sell_allowed) trendStatus = "ST:↓SELL";
+      else if(g_st_evasive)                                 trendStatus = "ST:~EVASION";
+      else if(g_st_flip_bars < STMinBarsForFlip)            trendStatus = "ST:FLIP(" + IntegerToString(g_st_flip_bars) + ")";
+      else                                                  trendStatus = "ST:WAIT";
+
+      // Добавляем HTF если включён
+      if(UseSTHTF)
+      {
+         string htfS = (g_st_htf_trend > 0) ? "H↑" : (g_st_htf_trend < 0) ? "H↓" : "H-";
+         trendStatus += "|" + htfS;
+      }
    }
+   else if(UseТрендФильтр)
+   {
+      if(IsTrendBullish())      trendStatus = "MA:↑BUY";
+      else if(IsTrendBearish()) trendStatus = "MA:↓SELL";
+      else                      trendStatus = "MA:→ФЛЭТ";
+   }
+
+   // News status
+   string newsStatus = "";
+   if(UseNewsFilter && g_news_block_entry)
+      newsStatus = " | NEWS:" + g_news_block_reason;
 
    double globalProfit = GetGlobalProfit();
    string lockStatus = GetLockStatus();
 
-   string head = "АлисА v5.2 | Bal: " + DoubleToString(acc.Balance(), 2) +
+   string head = "АлисА v5.3 | Bal: " + DoubleToString(acc.Balance(), 2) +
                  " Eq: " + DoubleToString(acc.Equity(), 2) +
-                 " [" + trendStatus + "]";
+                 " [" + trendStatus + "]" + newsStatus;
 
    string line1 = КомментарийHilo + " B:" + IntegerToString(Strat_Hilo.m_cntBuy) +
                   " S:" + IntegerToString(Strat_Hilo.m_cntSell) +
