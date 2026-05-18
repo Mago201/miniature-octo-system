@@ -38,13 +38,30 @@
 //|   8) Опция InpHtfFailOpen — поведение при недоступном HTF        |
 //|      (htf==0): true — пропускать сигналы, false — блокировать.   |
 //|   9) Визуальный бейдж в углу графика со статусом HTF (Up/Dn/--). |
+//|                                                                  |
+//|  Версия 2.03 — визуализация, лог, производительность:            |
+//|  10) Линии уровней Герчика (HH/LL) на основном графике —         |
+//|      InpDrawFBGLevels: видно, относительно чего был «ложный      |
+//|      пробой».                                                    |
+//|  11) Линия HTF SuperTrend на основном графике (цветная) —        |
+//|      InpDrawHtfST: уровень старшего ТФ под глазами.              |
+//|  12) CSV-лог сигналов: ST-флип, FBG buy/sell, встречный крест.   |
+//|      InpLogToCSV + InpLogFileName, поля: time;symbol;period;     |
+//|      type;side;price;level;ltf;htf;evasive;atr.                  |
+//|  13) Расширенный HTF-бейдж (InpHtfBadgeDetails): дополнительная  |
+//|      строка с LTF-трендом и флагом evasive.                      |
+//|  14) Производительность: инкрементальный курсор для HTF-поиска   |
+//|      (амортизированно O(1) на бар) и скользящее окно для         |
+//|      Efficiency Ratio в адаптивном ATR (вместо O(n) на бар).    |
+//|  15) Косметика: короткий лейбл таймфрейма в алертах (M15, H1)    |
+//|      вместо PERIOD_M15.                                          |
 //+------------------------------------------------------------------+
 #property copyright "Devin"
-#property version   "2.02"
-#property description "СуперТренд с уходом от шума + ложный пробой по Герчику (фильтр по тренду и встречный крест)"
+#property version   "2.03"
+#property description "СуперТренд+Герчик: HTF-фильтр, уровни FBG, линия HTF ST, CSV-лог"
 #property indicator_chart_window
-#property indicator_buffers 18
-#property indicator_plots   8
+#property indicator_buffers 22
+#property indicator_plots   11
 
 //--- Plot 0: основная линия СуперТренда (сплошная)
 #property indicator_label1   "СуперТренд"
@@ -94,6 +111,27 @@
 #property indicator_type8    DRAW_ARROW
 #property indicator_color8   clrRed
 #property indicator_width8   4
+
+//--- Plot 8: линия HTF SuperTrend на основном графике (цветная)
+#property indicator_label9   "HTF СуперТренд"
+#property indicator_type9    DRAW_COLOR_LINE
+#property indicator_color9   clrSeaGreen,clrFireBrick
+#property indicator_style9   STYLE_DASHDOT
+#property indicator_width9   2
+
+//--- Plot 9: верхний уровень Герчика (сопротивление, HH)
+#property indicator_label10  "Герчик HH"
+#property indicator_type10   DRAW_LINE
+#property indicator_color10  clrGoldenrod
+#property indicator_style10  STYLE_DOT
+#property indicator_width10  1
+
+//--- Plot 10: нижний уровень Герчика (поддержка, LL)
+#property indicator_label11  "Герчик LL"
+#property indicator_type11   DRAW_LINE
+#property indicator_color11  clrSteelBlue
+#property indicator_style11  STYLE_DOT
+#property indicator_width11  1
 
 //================== Перечисления =====================================
 enum ENUM_FBG_LEVEL_MODE
@@ -158,6 +196,18 @@ input string             InpSoundFile      = "alert.wav";// Звуковой ф�
 input bool               InpAlertPush      = false;      // Push-уведомление
 input bool               InpAlertEmail     = false;      // E-mail оповещение
 
+input group "=== v2.03: визуализация уровней и HTF ==="
+input bool               InpDrawFBGLevels  = true;       // Рисовать линии HH/LL Герчика
+input bool               InpDrawHtfST      = false;      // Рисовать линию HTF SuperTrend на основном графике
+input bool               InpHtfBadgeDetails= false;      // Расширенный бейдж: добавить LTF и флаг ухода
+
+input group "=== v2.03: журнал сигналов (CSV) ==="
+input bool               InpLogToCSV       = false;      // Писать сигналы в CSV-файл (MQL5/Files)
+input string             InpLogFileName    = "EvasiveST_FBG_signals.csv"; // Имя CSV-файла
+input bool               InpLogSTFlip      = true;       // Логировать флипы СуперТренда
+input bool               InpLogFBG         = true;       // Логировать сигналы Герчика (BUY/SELL)
+input bool               InpLogCounter     = true;       // Логировать встречные кресты
+
 //================== Буферы индикатора ============================
 double BufSTSolid[];       // 0
 double BufSTSolidCol[];    // 1
@@ -173,19 +223,31 @@ double BufCandleCol[];     // 10
 double BufFBGBuy[];        // 11
 double BufFBGSell[];       // 12
 double BufFBGCross[];      // 13
-double BufTrend[];         // 14 calc
-double BufFU[];            // 15 calc - final upper
-double BufFL[];            // 16 calc - final lower
-double BufEvasive[];       // 17 calc - 1 if evasive mode active
+double BufHtfST[];         // 14 (v2.03) — линия HTF ST
+double BufHtfSTCol[];      // 15 (v2.03) — цветовой индекс HTF ST
+double BufFBGHigh[];       // 16 (v2.03) — линия HH (сопротивление)
+double BufFBGLow[];        // 17 (v2.03) — линия LL (поддержка)
+double BufTrend[];         // 18 calc
+double BufFU[];            // 19 calc - final upper
+double BufFL[];            // 20 calc - final lower
+double BufEvasive[];       // 21 calc - 1 if evasive mode active
 
 //================== Состояние индикатора =========================
 double      g_atr[];
-struct HTFTrendBar { datetime time; int trend; };
+//--- (v2.03) скользящие суммы для Efficiency Ratio (адаптивный ATR)
+double      g_erVol[];      // суммарная |Δclose| в окне
+double      g_erChange[];   // |close[i]-close[i-n]|
+struct HTFTrendBar { datetime time; int trend; double st; int col; };
 HTFTrendBar g_htf[];
 datetime    g_htfLastUpdate = 0;
+//--- (v2.03) инкрементальный курсор для HTFTrendAt по монотонному времени
+int         g_htfCursor = 0;
 datetime    g_lastSTAlertTime  = 0;
 datetime    g_lastFBGAlertTime = 0;
 datetime    g_lastCrossAlertTime = 0;
+//--- (v2.03) кэш handle лог-файла (файл переоткрывается реже)
+int         g_logHandle = INVALID_HANDLE;
+string      g_logFileName = "";
 
 //--- имя графического объекта-бейджа HTF
 const string HTF_BADGE_NAME = "EvST_FBG_HTF_Badge";
@@ -198,6 +260,79 @@ double PipSize()
    int d = (int)_Digits;
    if(d == 3 || d == 5) return _Point * 10.0;
    return _Point;
+  }
+
+//+------------------------------------------------------------------+
+//| (v2.03 #15) Короткий человекочитаемый лейбл таймфрейма           |
+//|   Заменяет EnumToString(PERIOD_M15) -> "M15".                    |
+//+------------------------------------------------------------------+
+string TfLabel(const ENUM_TIMEFRAMES tf)
+  {
+   string s = EnumToString(tf);
+   int p = StringFind(s, "PERIOD_");
+   if(p == 0) s = StringSubstr(s, 7);
+   return s;
+  }
+
+//+------------------------------------------------------------------+
+//| (v2.03 #12) Открытие/переоткрытие CSV-журнала                    |
+//|   Формат: time;symbol;period;type;side;price;level;ltf;htf;      |
+//|           evasive;atr                                            |
+//+------------------------------------------------------------------+
+void OpenLogFile()
+  {
+   if(!InpLogToCSV) { CloseLogFile(); return; }
+   if(g_logHandle != INVALID_HANDLE && g_logFileName == InpLogFileName) return;
+   CloseLogFile();
+   bool fresh = !FileIsExist(InpLogFileName);
+   g_logHandle = FileOpen(InpLogFileName, FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI, ';');
+   if(g_logHandle == INVALID_HANDLE)
+     {
+      PrintFormat("[EvasiveST_FBG] Не удалось открыть лог '%s', err=%d",
+                  InpLogFileName, GetLastError());
+      return;
+     }
+   FileSeek(g_logHandle, 0, SEEK_END);
+   if(fresh)
+     {
+      FileWrite(g_logHandle,
+                "time","symbol","period","type","side",
+                "price","level","ltf","htf","evasive","atr");
+     }
+   g_logFileName = InpLogFileName;
+  }
+
+void CloseLogFile()
+  {
+   if(g_logHandle != INVALID_HANDLE)
+     {
+      FileClose(g_logHandle);
+      g_logHandle = INVALID_HANDLE;
+     }
+   g_logFileName = "";
+  }
+
+//+------------------------------------------------------------------+
+//| (v2.03 #12) Записать одну строку события в CSV                   |
+//+------------------------------------------------------------------+
+void LogSignal(const datetime t, const string type, const string side,
+               const double price, const double level,
+               const int ltf, const int htf, const bool evasive,
+               const double atr)
+  {
+   if(!InpLogToCSV) return;
+   if(g_logHandle == INVALID_HANDLE) OpenLogFile();
+   if(g_logHandle == INVALID_HANDLE) return;
+   FileWrite(g_logHandle,
+             TimeToString(t, TIME_DATE|TIME_MINUTES|TIME_SECONDS),
+             _Symbol,
+             TfLabel((ENUM_TIMEFRAMES)_Period),
+             type, side,
+             DoubleToString(price, _Digits),
+             (level > 0.0) ? DoubleToString(level, _Digits) : "",
+             ltf, htf, (int)evasive,
+             DoubleToString(atr, _Digits));
+   FileFlush(g_logHandle);
   }
 
 //+------------------------------------------------------------------+
@@ -214,9 +349,9 @@ bool HTFAllows(const datetime t, const int side)
   }
 
 //+------------------------------------------------------------------+
-//| (правка #9) Создать/обновить бейдж со статусом HTF               |
+//| (правка #9 + v2.03 #13) Создать/обновить бейдж со статусом HTF   |
 //+------------------------------------------------------------------+
-void UpdateHTFBadge(const datetime barTime)
+void UpdateHTFBadge(const datetime barTime, const int ltfTrend, const bool evasive)
   {
    if(!InpUseHTF || !InpHtfShowBadge)
      {
@@ -228,9 +363,17 @@ void UpdateHTFBadge(const datetime barTime)
    int htf = HTFTrendAt(barTime);
    string txt;
    color  clr;
-   if(htf > 0)      { txt = "HTF " + EnumToString(InpHTF) + ": Up";  clr = clrLimeGreen; }
-   else if(htf < 0) { txt = "HTF " + EnumToString(InpHTF) + ": Dn";  clr = clrTomato;    }
-   else             { txt = "HTF " + EnumToString(InpHTF) + ": --";  clr = clrSilver;    }
+   if(htf > 0)      { txt = "HTF " + TfLabel(InpHTF) + ": Up";  clr = clrLimeGreen; }
+   else if(htf < 0) { txt = "HTF " + TfLabel(InpHTF) + ": Dn";  clr = clrTomato;    }
+   else             { txt = "HTF " + TfLabel(InpHTF) + ": --";  clr = clrSilver;    }
+
+   //--- (v2.03 #13) при включённой детализации добавляем LTF + флаг ухода
+   if(InpHtfBadgeDetails)
+     {
+      string ltfTxt = (ltfTrend > 0) ? "Up" : (ltfTrend < 0) ? "Dn" : "--";
+      txt += "  |  LTF " + TfLabel((ENUM_TIMEFRAMES)_Period) + ": " + ltfTxt;
+      if(evasive) txt += " (evasive)";
+     }
 
    if(ObjectFind(0, HTF_BADGE_NAME) < 0)
      {
@@ -270,10 +413,17 @@ int OnInit()
    SetIndexBuffer(11, BufFBGBuy,       INDICATOR_DATA);
    SetIndexBuffer(12, BufFBGSell,      INDICATOR_DATA);
    SetIndexBuffer(13, BufFBGCross,     INDICATOR_DATA);
-   SetIndexBuffer(14, BufTrend,        INDICATOR_CALCULATIONS);
-   SetIndexBuffer(15, BufFU,           INDICATOR_CALCULATIONS);
-   SetIndexBuffer(16, BufFL,           INDICATOR_CALCULATIONS);
-   SetIndexBuffer(17, BufEvasive,      INDICATOR_CALCULATIONS);
+   //--- (v2.03) HTF ST line + цветовой индекс
+   SetIndexBuffer(14, BufHtfST,        INDICATOR_DATA);
+   SetIndexBuffer(15, BufHtfSTCol,     INDICATOR_COLOR_INDEX);
+   //--- (v2.03) уровни Герчика
+   SetIndexBuffer(16, BufFBGHigh,      INDICATOR_DATA);
+   SetIndexBuffer(17, BufFBGLow,       INDICATOR_DATA);
+   //--- служебные расчётные буферы
+   SetIndexBuffer(18, BufTrend,        INDICATOR_CALCULATIONS);
+   SetIndexBuffer(19, BufFU,           INDICATOR_CALCULATIONS);
+   SetIndexBuffer(20, BufFL,           INDICATOR_CALCULATIONS);
+   SetIndexBuffer(21, BufEvasive,      INDICATOR_CALCULATIONS);
 
    PlotIndexSetInteger(2, PLOT_ARROW, InpArrowBuyCode);
    PlotIndexSetInteger(3, PLOT_ARROW, InpArrowSellCode);
@@ -283,14 +433,18 @@ int OnInit()
 
    //--- (правка #2) для линий/стрелок «пусто» = EMPTY_VALUE,
    //    для DRAW_COLOR_CANDLES (plot 4) — 0.0
-   PlotIndexSetDouble(0, PLOT_EMPTY_VALUE, EMPTY_VALUE);
-   PlotIndexSetDouble(1, PLOT_EMPTY_VALUE, EMPTY_VALUE);
-   PlotIndexSetDouble(2, PLOT_EMPTY_VALUE, EMPTY_VALUE);
-   PlotIndexSetDouble(3, PLOT_EMPTY_VALUE, EMPTY_VALUE);
-   PlotIndexSetDouble(4, PLOT_EMPTY_VALUE, 0.0);
-   PlotIndexSetDouble(5, PLOT_EMPTY_VALUE, EMPTY_VALUE);
-   PlotIndexSetDouble(6, PLOT_EMPTY_VALUE, EMPTY_VALUE);
-   PlotIndexSetDouble(7, PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   PlotIndexSetDouble(0,  PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   PlotIndexSetDouble(1,  PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   PlotIndexSetDouble(2,  PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   PlotIndexSetDouble(3,  PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   PlotIndexSetDouble(4,  PLOT_EMPTY_VALUE, 0.0);
+   PlotIndexSetDouble(5,  PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   PlotIndexSetDouble(6,  PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   PlotIndexSetDouble(7,  PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   //--- (v2.03) HTF ST line + уровни Герчика
+   PlotIndexSetDouble(8,  PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   PlotIndexSetDouble(9,  PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   PlotIndexSetDouble(10, PLOT_EMPTY_VALUE, EMPTY_VALUE);
 
    if(!InpColorCandles)
       PlotIndexSetInteger(4, PLOT_DRAW_TYPE, DRAW_NONE);
@@ -301,24 +455,40 @@ int OnInit()
      }
    if(!InpFBGEnabled)
      {
-      PlotIndexSetInteger(5, PLOT_DRAW_TYPE, DRAW_NONE);
-      PlotIndexSetInteger(6, PLOT_DRAW_TYPE, DRAW_NONE);
-      PlotIndexSetInteger(7, PLOT_DRAW_TYPE, DRAW_NONE);
+      PlotIndexSetInteger(5,  PLOT_DRAW_TYPE, DRAW_NONE);
+      PlotIndexSetInteger(6,  PLOT_DRAW_TYPE, DRAW_NONE);
+      PlotIndexSetInteger(7,  PLOT_DRAW_TYPE, DRAW_NONE);
+      PlotIndexSetInteger(9,  PLOT_DRAW_TYPE, DRAW_NONE);
+      PlotIndexSetInteger(10, PLOT_DRAW_TYPE, DRAW_NONE);
      }
    else if(!InpDrawCounterCross)
       PlotIndexSetInteger(7, PLOT_DRAW_TYPE, DRAW_NONE);
+
+   //--- (v2.03 #10) уровни Герчика отключаем явным флагом
+   if(!InpDrawFBGLevels)
+     {
+      PlotIndexSetInteger(9,  PLOT_DRAW_TYPE, DRAW_NONE);
+      PlotIndexSetInteger(10, PLOT_DRAW_TYPE, DRAW_NONE);
+     }
+   //--- (v2.03 #11) HTF ST линия — зависит от InpUseHTF и InpDrawHtfST
+   if(!InpUseHTF || !InpDrawHtfST)
+      PlotIndexSetInteger(8, PLOT_DRAW_TYPE, DRAW_NONE);
 
    IndicatorSetString(INDICATOR_SHORTNAME,
       StringFormat("СуперТренд+Герчик (ATR=%d, x%.2f, шум=%.2f, расш=%.2f%s%s%s)",
          InpAtrLength, InpBaseMultiplier, InpNoiseThreshold, InpExpansionAlpha,
          InpAdaptive       ? ", адаптив" : "",
-         InpUseHTF         ? StringFormat(", стТФ=%s", EnumToString(InpHTF)) : "",
+         InpUseHTF         ? StringFormat(", стТФ=%s", TfLabel(InpHTF)) : "",
          InpFBGEnabled     ? (InpOnlyWithTrend ? ", Герчик-по тренду" : ", Герчик-все") : ""));
 
    g_htfLastUpdate     = 0;
+   g_htfCursor         = 0;
    g_lastSTAlertTime   = 0;
    g_lastFBGAlertTime  = 0;
    g_lastCrossAlertTime= 0;
+
+   //--- (v2.03 #12) открываем CSV-журнал, если включён
+   OpenLogFile();
    return INIT_SUCCEEDED;
   }
 
@@ -326,6 +496,9 @@ void OnDeinit(const int reason)
   {
    ArrayFree(g_atr);
    ArrayFree(g_htf);
+   ArrayFree(g_erVol);
+   ArrayFree(g_erChange);
+   CloseLogFile();
    if(ObjectFind(0, HTF_BADGE_NAME) >= 0)
       ObjectDelete(0, HTF_BADGE_NAME);
   }
@@ -347,6 +520,43 @@ double EfficiencyRatio(const double &close[], const int i, const int n)
   }
 
 //+------------------------------------------------------------------+
+//| (v2.03 #14) Скользящие окна для Efficiency Ratio                 |
+//|   g_erVol[i]    — сумма |Δclose| за последние n шагов до i       |
+//|   g_erChange[i] — |close[i] - close[i-n]|                        |
+//|   Поддерживаются инкрементально: O(1) на бар.                    |
+//+------------------------------------------------------------------+
+void EnsureERWindow(const int rates_total)
+  {
+   if(ArraySize(g_erVol)    != rates_total) ArrayResize(g_erVol,    rates_total);
+   if(ArraySize(g_erChange) != rates_total) ArrayResize(g_erChange, rates_total);
+  }
+
+double EfficiencyRatioFast(const double &close[], const int i, const int n)
+  {
+   if(i < n) return 0.0;
+   //--- скользящая сумма |Δclose|: prev + новый шаг − выпавший шаг
+   //    шаг k = |close[k] - close[k-1]|, окно k ∈ (i-n, i]
+   double vol;
+   if(i == n)
+     {
+      double s = 0.0;
+      for(int k=1; k<=n; ++k) s += MathAbs(close[k] - close[k-1]);
+      vol = s;
+     }
+   else
+     {
+      double dropped = MathAbs(close[i-n] - close[i-n-1]);
+      double added   = MathAbs(close[i]   - close[i-1]);
+      vol = g_erVol[i-1] + added - dropped;
+      if(vol < 0.0) vol = 0.0;
+     }
+   g_erVol[i] = vol;
+   double change = MathAbs(close[i] - close[i-n]);
+   g_erChange[i] = change;
+   return (vol > 0.0) ? change / vol : 0.0;
+  }
+
+//+------------------------------------------------------------------+
 //| Построение/обновление кэша ATR (Уайлдер или Кауфман)             |
 //+------------------------------------------------------------------+
 void ComputeATR(const int rates_total,
@@ -358,6 +568,7 @@ void ComputeATR(const int rates_total,
 
    if(InpAdaptive)
      {
+      EnsureERWindow(rates_total);
       double fast = 2.0 / (InpAdaptiveMin + 1.0);
       double slow = 2.0 / (InpAdaptiveMax + 1.0);
       double prev = TrueRange(high[1], low[1], close[0]);
@@ -365,7 +576,7 @@ void ComputeATR(const int rates_total,
       for(int i=2; i<rates_total; ++i)
         {
          double tr = TrueRange(high[i], low[i], close[i-1]);
-         double er = EfficiencyRatio(close, i, InpEfficiencyLen);
+         double er = EfficiencyRatioFast(close, i, InpEfficiencyLen);
          double sc = MathPow(er * (fast - slow) + slow, 2.0);
          prev = prev + sc * (tr - prev);
          g_atr[i] = prev;
@@ -412,6 +623,7 @@ void RebuildHTFTrend()
    int    p = (InpHtfAtrPeriod < 1) ? 1 : InpHtfAtrPeriod;
    int trend = 1;
    g_htf[0].time = r[0].time; g_htf[0].trend = trend;
+   g_htf[0].st   = 0.0;       g_htf[0].col   = 0;
 
    for(int i=1; i<copied; ++i)
      {
@@ -437,16 +649,42 @@ void RebuildHTFTrend()
       if(trend == 1)  trend = (r[i].close < fl) ? -1 :  1;
       else            trend = (r[i].close > fu) ?  1 : -1;
 
+      //--- (v2.03 #11) сохраняем уровень линии ST на HTF и цветовой индекс
       g_htf[i].trend = trend;
+      g_htf[i].st    = (trend == 1) ? fl : fu;
+      g_htf[i].col   = (trend == 1) ? 0  : 1;
       prevUpper = fu; prevLower = fl;
      }
    g_htfLastUpdate = lastHTFBar;
+   //--- (v2.03 #14) сбрасываем курсор поиска: массив пересобран
+   g_htfCursor = 0;
   }
 
 int HTFTrendAt(const datetime t)
   {
    int n = ArraySize(g_htf);
    if(n == 0) return 0;
+   //--- (v2.03 #14) Инкрементальный курсор: время в OnCalculate монотонно
+   //    растёт, поэтому в среднем курсор сдвигается на 1 шаг вперёд за раз.
+   //    Проваливаемся в бинарный поиск только если курсор оторван (history
+   //    refresh, прыжок назад).
+   int idx = g_htfCursor;
+   if(idx >= n) idx = n - 1;
+   if(idx < 0)  idx = 0;
+   if(g_htf[idx].time <= t)
+     {
+      while(idx + 1 < n && g_htf[idx + 1].time <= t) ++idx;
+      g_htfCursor = idx;
+      return g_htf[idx].trend;
+     }
+   //--- курсор впереди искомого времени → линейный откат недорогой,
+   //    но защищаемся от больших скачков назад классическим поиском
+   if(idx > 0 && g_htf[idx - 1].time <= t)
+     {
+      g_htfCursor = idx - 1;
+      return g_htf[idx - 1].trend;
+     }
+   //--- редкая ветка: фолбек на бинарный поиск
    int lo=0, hi=n-1, ans=-1;
    while(lo <= hi)
      {
@@ -454,7 +692,28 @@ int HTFTrendAt(const datetime t)
       if(g_htf[mid].time <= t) { ans = mid; lo = mid+1; }
       else hi = mid-1;
      }
-   return (ans < 0) ? 0 : g_htf[ans].trend;
+   if(ans < 0) return 0;
+   g_htfCursor = ans;
+   return g_htf[ans].trend;
+  }
+
+//+------------------------------------------------------------------+
+//| (v2.03 #11) Получить уровень и цвет HTF SuperTrend на время t    |
+//|   Возвращает false, если данных нет.                             |
+//+------------------------------------------------------------------+
+bool HTFLineAt(const datetime t, double &outSt, int &outCol)
+  {
+   int n = ArraySize(g_htf);
+   if(n == 0) return false;
+   //--- сначала найдём индекс через тот же курсор, что и HTFTrendAt
+   HTFTrendAt(t);
+   int idx = g_htfCursor;
+   if(idx < 0 || idx >= n) return false;
+   if(g_htf[idx].time > t) return false; // совсем нет покрытия
+   if(g_htf[idx].st <= 0.0) return false; // первый бар-сид
+   outSt  = g_htf[idx].st;
+   outCol = g_htf[idx].col;
+   return true;
   }
 
 //+------------------------------------------------------------------+
@@ -573,6 +832,11 @@ int OnCalculate(const int rates_total,
       ArrayInitialize(BufFBGBuy,       EMPTY_VALUE);
       ArrayInitialize(BufFBGSell,      EMPTY_VALUE);
       ArrayInitialize(BufFBGCross,     EMPTY_VALUE);
+      //--- (v2.03) новые буферы
+      ArrayInitialize(BufHtfST,        EMPTY_VALUE);
+      ArrayInitialize(BufHtfSTCol,     0);
+      ArrayInitialize(BufFBGHigh,      EMPTY_VALUE);
+      ArrayInitialize(BufFBGLow,       EMPTY_VALUE);
       ArrayInitialize(BufTrend,        1);
       ArrayInitialize(BufFU,           0);
       ArrayInitialize(BufFL,           0);
@@ -647,6 +911,19 @@ int OnCalculate(const int rates_total,
          BufCandleCol[i] = (trend == 1) ? 0 : 1;
         }
 
+      //--- (v2.03 #11) линия HTF SuperTrend на основном графике
+      BufHtfST[i]    = EMPTY_VALUE;
+      BufHtfSTCol[i] = 0;
+      if(InpUseHTF && InpDrawHtfST)
+        {
+         double htfSt; int htfCol;
+         if(HTFLineAt(time[i], htfSt, htfCol))
+           {
+            BufHtfST[i]    = htfSt;
+            BufHtfSTCol[i] = htfCol;
+           }
+        }
+
       //--- (правка #1) на самом первом обработанном баре нет надёжного
       //    предыдущего тренда: BufTrend[0] был засеян значением 1, и любой
       //    реальный медвежий старт давал бы ложный «флип». Подавляем.
@@ -671,6 +948,13 @@ int OnCalculate(const int rates_total,
 
       double lh = 0, ll = 0;
       if(!GetFBGLevels(i, time, high, low, lh, ll)) continue;
+
+      //--- (v2.03 #10) рисуем уровни HH/LL Герчика
+      if(InpDrawFBGLevels)
+        {
+         BufFBGHigh[i] = lh;
+         BufFBGLow[i]  = ll;
+        }
 
       double body = MathAbs(close[i] - open[i]);
       double mid  = (high[i] + low[i]) * 0.5;
@@ -720,9 +1004,14 @@ int OnCalculate(const int rates_total,
             g_lastFBGAlertTime = time[i];
             string side = isBuy ? "ПОКУПКА" : "ПРОДАЖА";
             FireAlert(StringFormat("Герчик %s (по тренду) | %s %s @ %s | уровень %s",
-                       side, _Symbol, EnumToString((ENUM_TIMEFRAMES)_Period),
+                       side, _Symbol, TfLabel((ENUM_TIMEFRAMES)_Period),
                        DoubleToString(close[i], _Digits),
                        DoubleToString(isBuy ? ll : lh, _Digits)));
+            //--- (v2.03 #12) CSV-лог сигнала FBG (по тренду)
+            if(InpLogFBG)
+               LogSignal(time[i], "FBG", isBuy ? "BUY" : "SELL",
+                         close[i], (isBuy ? ll : lh),
+                         trend, HTFTrendAt(time[i]), evasive, atr);
            }
         }
       else
@@ -757,8 +1046,13 @@ int OnCalculate(const int rates_total,
                               : !ltfAgree            ? "LTF"
                               :                        "HTF";
                FireAlert(StringFormat("Герчик встречный сигнал против %s [%s] | %s %s @ %s",
-                          side, cause, _Symbol, EnumToString((ENUM_TIMEFRAMES)_Period),
+                          side, cause, _Symbol, TfLabel((ENUM_TIMEFRAMES)_Period),
                           DoubleToString(close[i], _Digits)));
+               //--- (v2.03 #12) CSV-лог встречного креста
+               if(InpLogCounter)
+                  LogSignal(time[i], "FBG_COUNTER", (sigSide == 1) ? "BUY" : "SELL",
+                            close[i], (sigSide == 1) ? ll : lh,
+                            trend, HTFTrendAt(time[i]), evasive, atr);
               }
            }
         }
@@ -780,15 +1074,25 @@ int OnCalculate(const int rates_total,
             g_lastSTAlertTime = barT;
             string side = fireBuy ? "БЫЧИЙ" : "МЕДВЕЖИЙ";
             FireAlert(StringFormat("СуперТренд %s флип | %s %s @ %s",
-                       side, _Symbol, EnumToString((ENUM_TIMEFRAMES)_Period),
+                       side, _Symbol, TfLabel((ENUM_TIMEFRAMES)_Period),
                        DoubleToString(close[alertBarIdx], _Digits)));
+            //--- (v2.03 #12) CSV-журнал
+            if(InpLogSTFlip)
+               LogSignal(barT, "ST_FLIP", fireBuy ? "BUY" : "SELL",
+                         close[alertBarIdx], 0.0,
+                         curTrend, HTFTrendAt(barT), false, g_atr[alertBarIdx]);
            }
         }
      }
 
-   //--- (правка #9) обновляем бейдж HTF на каждом расчёте
+   //--- (правка #9 + v2.03 #13) обновляем бейдж HTF на каждом расчёте
    if(rates_total >= 1)
-      UpdateHTFBadge(time[rates_total-1]);
+     {
+      int    lastIdx    = rates_total - 1;
+      int    lastTrend  = (int)BufTrend[lastIdx];
+      bool   lastEvas   = (BufEvasive[lastIdx] > 0.5);
+      UpdateHTFBadge(time[lastIdx], lastTrend, lastEvas);
+     }
 
    return rates_total;
   }
