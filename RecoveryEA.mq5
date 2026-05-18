@@ -24,10 +24,20 @@
 //|      profit, EA does not close immediately; it lets P/L grow     |
 //|      and only closes when P/L retraces by InpTrailGiveback from  |
 //|      the recorded peak. Per-side state, reset on basket close.   |
+//|                                                                  |
+//|  v1.20 — Алиса handoff (Variant 2):                              |
+//|    * Adoption can be restricted to a CSV list of magics          |
+//|      (InpAdoptionMode=ADOPT_BY_MAGIC_LIST). Recovery picks up    |
+//|      ONLY positions opened by listed Алиса strategies.           |
+//|    * Reads GV "Alisa.Halt" — if 0, Recovery stays passive        |
+//|      (InpHandoffOnlyWhenAlisaHalted=true).                       |
+//|    * Sets GV "Alisa.Recovery.Active" to 1 while there are        |
+//|      adopted positions; clears to 0 when basket is empty,        |
+//|      so Алиса can resume.                                        |
 //+------------------------------------------------------------------+
 #property copyright "Swill Way"
-#property version   "1.10"
-#property description "Recovery EA: adopts losing basket on chart symbol, ATR/pip averaging, basket-TP with trailing, best+worst partial close, ST-direction filter, hard equity stop."
+#property version   "1.20"
+#property description "Recovery EA: adopts losing basket on chart symbol, ATR/pip averaging, basket-TP with trailing, best+worst partial close, ST-direction filter, hard equity stop, Алиса handoff."
 
 #include <Trade/Trade.mqh>
 #include <Trade/SymbolInfo.mqh>
@@ -40,11 +50,14 @@ CPositionInfo Pos;
 enum ENUM_STEP_MODE   { STEP_PIPS=0, STEP_ATR=1 };
 enum ENUM_TP_MODE     { TP_MONEY=0, TP_PERCENT_BAL=1, TP_PIPS_WEIGHTED=2 };
 enum ENUM_ST_FILTER   { ST_FILTER_NONE=0, ST_FILTER_LTF=1, ST_FILTER_HTF=2 };
+enum ENUM_ADOPT_MODE  { ADOPT_OWN_MAGIC=0, ADOPT_ALL_FOREIGN=1, ADOPT_BY_MAGIC_LIST=2 };
 
 //================== Inputs ==========================================
 input group "=== Идентификация ==="
-input long   InpMagic            = 770077;   // Magic для новых ордеров
-input bool   InpAdoptForeign     = true;     // Принимать существующие позиции на _Symbol с любым magic
+input long   InpMagic            = 770077;   // Magic для новых ордеров (усреднения)
+input bool   InpAdoptForeign     = true;     // [LEGACY] Игнорируется при InpAdoptionMode != ADOPT_OWN_MAGIC
+input ENUM_ADOPT_MODE InpAdoptionMode = ADOPT_BY_MAGIC_LIST; // Какие позиции брать на сопровождение
+input string InpAdoptMagicsCSV   = "852791,852792,852793";   // Список магиков (для ADOPT_BY_MAGIC_LIST)
 input string InpComment          = "Recovery";
 
 input group "=== Область восстановления ==="
@@ -106,6 +119,11 @@ input group "=== Тайминг ==="
 input int    InpAddCooldownSec   = 30;       // Минимальная пауза между добавками (на каждую сторону)
 input int    InpTimerSec         = 2;        // Внутренний таймер для проверок без тика
 
+input group "=== Алиса handoff ==="
+input bool   InpHandoffEnabled              = true;   // Слушать GV Alisa.Halt и публиковать Alisa.Recovery.Active
+input bool   InpHandoffOnlyWhenAlisaHalted  = true;   // Работать ТОЛЬКО когда Alisa.Halt=1 (иначе пассивно)
+input bool   InpHandoffPublishActive        = true;   // Публиковать GV Alisa.Recovery.Active
+
 //================== State ===========================================
 int      g_atrHandle      = INVALID_HANDLE;
 int      g_stHandle       = INVALID_HANDLE;
@@ -116,6 +134,15 @@ datetime g_lastAddTime[2] = {0,0};   // [0]=BUY, [1]=SELL
 //--- trailing-target state (per side; reset when basket goes to 0)
 double   g_peakProfit[2]    = {0.0, 0.0};
 bool     g_trailArmed[2]    = {false, false};
+
+//--- handoff state
+const string GV_HANDOFF_HALT     = "Alisa.Halt";
+const string GV_HANDOFF_EQUITY   = "Alisa.AttachEquity";
+const string GV_HANDOFF_ACTIVE   = "Alisa.Recovery.Active";
+
+//--- adoption magic-list cache (parsed from InpAdoptMagicsCSV at init)
+ulong  g_adoptMagics[];
+int    g_adoptMagicsCount = 0;
 
 //================== Helpers =========================================
 double PipSize()
@@ -154,8 +181,75 @@ bool BelongsToBasket(const ulong ticket)
 {
    if(!Pos.SelectByTicket(ticket)) return false;
    if(Pos.Symbol() != _Symbol)     return false;
-   if(!InpAdoptForeign && (long)Pos.Magic() != InpMagic) return false;
-   return true;
+
+   ulong m = Pos.Magic();
+   switch(InpAdoptionMode)
+   {
+      case ADOPT_OWN_MAGIC:
+         return (m == (ulong)InpMagic);
+
+      case ADOPT_ALL_FOREIGN:
+         return true;
+
+      case ADOPT_BY_MAGIC_LIST:
+      {
+         if(m == (ulong)InpMagic) return true;   // свои усреднения тоже принимаем
+         for(int i = 0; i < g_adoptMagicsCount; ++i)
+            if(g_adoptMagics[i] == m) return true;
+         return false;
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Parse CSV "852791,852792,852793" into g_adoptMagics              |
+//+------------------------------------------------------------------+
+void ParseAdoptMagicsCSV(const string csv)
+{
+   ArrayResize(g_adoptMagics, 0);
+   g_adoptMagicsCount = 0;
+
+   string parts[];
+   int n = StringSplit(csv, ',', parts);
+   if(n <= 0) return;
+
+   ArrayResize(g_adoptMagics, n);
+   for(int i = 0; i < n; ++i)
+   {
+      string s = parts[i];
+      StringTrimLeft(s); StringTrimRight(s);
+      if(StringLen(s) == 0) continue;
+      long v = StringToInteger(s);
+      if(v <= 0) continue;
+      g_adoptMagics[g_adoptMagicsCount++] = (ulong)v;
+   }
+   ArrayResize(g_adoptMagics, g_adoptMagicsCount);
+}
+
+//+------------------------------------------------------------------+
+//| Алиса handoff — read/write GVs                                   |
+//+------------------------------------------------------------------+
+bool HandoffAlisaHalted()
+{
+   if(!InpHandoffEnabled) return false;
+   if(!GlobalVariableCheck(GV_HANDOFF_HALT)) return false;
+   return GlobalVariableGet(GV_HANDOFF_HALT) > 0.5;
+}
+
+void HandoffPublishActive(bool active)
+{
+   if(!InpHandoffEnabled || !InpHandoffPublishActive) return;
+   if(active)
+   {
+      GlobalVariableSet(GV_HANDOFF_ACTIVE, 1.0);
+      GlobalVariableTemp(GV_HANDOFF_ACTIVE);
+   }
+   else
+   {
+      if(GlobalVariableCheck(GV_HANDOFF_ACTIVE))
+         GlobalVariableSet(GV_HANDOFF_ACTIVE, 0.0);
+   }
 }
 
 void CalcBasket(const ENUM_POSITION_TYPE wantType, BasketInfo &b)
@@ -477,17 +571,31 @@ void UpdateChartLabel(const BasketInfo &bb, const BasketInfo &sb)
                         EnumToString(InpSTTimeframe), s);
    }
 
+   string ho = "";
+   if(InpHandoffEnabled)
+   {
+      bool halted = HandoffAlisaHalted();
+      bool active = (bb.count > 0 || sb.count > 0);
+      ho = StringFormat("\nHandoff: AlisaHalt=%s | RecoveryActive=%s | Adoption=%s (n=%d)",
+                        halted ? "1" : "0",
+                        active ? "1" : "0",
+                        (InpAdoptionMode == ADOPT_OWN_MAGIC)     ? "OWN"
+                       :(InpAdoptionMode == ADOPT_ALL_FOREIGN)   ? "ALL"
+                       :                                          "LIST",
+                        g_adoptMagicsCount);
+   }
+
    string text = StringFormat(
       "Recovery EA  |  Eq=%.2f  Bal=%.2f  AttachEq=%.2f%s\n"
       "BUY:  n=%d  vol=%.2f  avg=%.5f  worst=%.5f  P/L=%+.2f\n"
-      "SELL: n=%d  vol=%.2f  avg=%.5f  worst=%.5f  P/L=%+.2f%s%s",
+      "SELL: n=%d  vol=%.2f  avg=%.5f  worst=%.5f  P/L=%+.2f%s%s%s",
       AccountInfoDouble(ACCOUNT_EQUITY),
       AccountInfoDouble(ACCOUNT_BALANCE),
       g_attachEquity,
       g_frozen ? "  [FROZEN]" : "",
       bb.count, bb.totalVolume, bb.avgPrice, bb.worstPrice, bb.profit,
       sb.count, sb.totalVolume, sb.avgPrice, sb.worstPrice, sb.profit,
-      trail, st);
+      trail, st, ho);
    Comment(text);
 }
 
@@ -501,6 +609,18 @@ void Cycle()
    BasketInfo bb, sb;
    CalcBasket(POSITION_TYPE_BUY,  bb);
    CalcBasket(POSITION_TYPE_SELL, sb);
+
+   //--- HANDOFF: если включён, и Алиса не в halt, и режим «работать только в halt» —
+   //    сидим тихо. Не открываем, не закрываем, лишь публикуем Active=0.
+   bool alisaHalted   = HandoffAlisaHalted();
+   bool weHavePos     = (bb.count > 0 || sb.count > 0);
+
+   if(InpHandoffEnabled && InpHandoffOnlyWhenAlisaHalted && !alisaHalted && !weHavePos)
+   {
+      HandoffPublishActive(false);
+      UpdateChartLabel(bb, sb);
+      return;
+   }
 
    //--- сбрасываем трейл-стейт, если корзина пустая
    if(bb.count == 0) ResetTrail(POSITION_TYPE_BUY);
@@ -525,6 +645,10 @@ void Cycle()
 
    CalcBasket(POSITION_TYPE_BUY,  bb);
    CalcBasket(POSITION_TYPE_SELL, sb);
+
+   //--- HANDOFF: публикуем Active = есть ли у нас сопровождаемые позиции
+   HandoffPublishActive(bb.count > 0 || sb.count > 0);
+
    UpdateChartLabel(bb, sb);
 }
 
@@ -567,6 +691,18 @@ int OnInit()
    ResetTrail(POSITION_TYPE_BUY);
    ResetTrail(POSITION_TYPE_SELL);
 
+   //--- handoff: парсим список магиков и публикуем стартовый Active
+   ParseAdoptMagicsCSV(InpAdoptMagicsCSV);
+   if(InpAdoptionMode == ADOPT_BY_MAGIC_LIST)
+      PrintFormat("Adoption: BY_MAGIC_LIST, %d magics parsed from \"%s\"",
+                  g_adoptMagicsCount, InpAdoptMagicsCSV);
+   else if(InpAdoptionMode == ADOPT_ALL_FOREIGN)
+      Print("Adoption: ALL foreign positions on this symbol.");
+   else
+      Print("Adoption: only own magic ", InpMagic, ".");
+
+   HandoffPublishActive(false);
+
    if((ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE)
        == ACCOUNT_MARGIN_MODE_RETAIL_NETTING)
       Print("WARNING: netting account. Recovery EA assumes hedging; behaviour will be approximate.");
@@ -580,6 +716,8 @@ void OnDeinit(const int reason)
    EventKillTimer();
    if(g_atrHandle != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
    if(g_stHandle  != INVALID_HANDLE) IndicatorRelease(g_stHandle);
+   //--- handoff: снимаем флаг Active, чтобы Алиса не висла в halt
+   HandoffPublishActive(false);
    Comment("");
 }
 
