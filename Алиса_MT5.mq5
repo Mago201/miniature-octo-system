@@ -244,7 +244,6 @@ datetime   g_recovery_check_time = 0;
 const string GV_HANDOFF_HALT     = "Alisa.Halt";
 const string GV_HANDOFF_EQUITY   = "Alisa.AttachEquity";
 const string GV_HANDOFF_ACTIVE   = "Alisa.Recovery.Active";
-const string GV_HANDOFF_MAGICS   = "Alisa.Magics";  // CSV-список магиков, читаемый Recovery
 bool g_handoff_halted = false;
 
 //+------------------------------------------------------------------+
@@ -330,11 +329,9 @@ void HandoffSetHalt(bool halted)
       GlobalVariableSet(GV_HANDOFF_EQUITY, AccountInfoDouble(ACCOUNT_EQUITY));
       GlobalVariableTemp(GV_HANDOFF_HALT);   // не сохранять в файл, чисто межпроцессно
       GlobalVariableTemp(GV_HANDOFF_EQUITY);
-      // CSV-список магиков (Recovery читает оттуда)
-      if(StringLen(HandoffMagicsCSV) == 0)
-         GlobalVariableSet(GV_HANDOFF_MAGICS, 0.0); // плейсхолдер; реальный список — через TerminalInfoString? нет, через файл — но GV хранит double; используем comment в Recovery
       Print("HANDOFF: halt=1, equity=", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2),
-            ". Recovery EA must be attached on this symbol.");
+            ". Recovery EA must be attached on this symbol with matching magics: ",
+            HandoffMagicsCSV);
    }
    else
    {
