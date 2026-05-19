@@ -89,10 +89,11 @@ enum ENUM_ENTRY_TRIGGER
 //--- Что закрывать при частичном восстановлении (v1.10)
 enum ENUM_PARTIAL_TARGET
   {
-   PCT_LARGEST_LOT   = 0, // Самая крупная по объёму
-   PCT_BIGGEST_LOSS  = 1, // С самым большим убытком
-   PCT_FIRST_OPENED  = 2, // Самая старая
-   PCT_LAST_OPENED   = 3  // Самая новая (последнее усреднение)
+   PCT_LARGEST_LOT     = 0, // Самая крупная по объёму
+   PCT_BIGGEST_LOSS    = 1, // С самым большим убытком (только если разрешено закрывать в минус)
+   PCT_FIRST_OPENED    = 2, // Самая старая
+   PCT_LAST_OPENED     = 3, // Самая новая (последнее усреднение)
+   PCT_BIGGEST_PROFIT  = 4  // С самой большой прибылью (по умолчанию — фиксация плюсов)
   };
 
 //================== Входные параметры ==============================
@@ -163,10 +164,11 @@ input bool             InpHedgeBlockAveraging = true;        // Запретит
 
 input group "=== Частичное закрытие на откате (v1.10) ==="
 input bool             InpUsePartialClose    = false;        // Включить частичное закрытие
+input bool             InpPartialOnlyProfitable = true;      // Закрывать ТОЛЬКО прибыльные позиции (никаких убытков)
 input int              InpPartialMinAverages = 3;            // Мин. число усреднений на стороне
 input double           InpPartialMinDDPct    = 3.0;          // Мин. достигнутая просадка для активации
 input double           InpPartialRecoveryPct = 30.0;         // % восстановления от пика DD
-input ENUM_PARTIAL_TARGET InpPartialTarget   = PCT_BIGGEST_LOSS; // Какую позицию закрывать
+input ENUM_PARTIAL_TARGET InpPartialTarget   = PCT_BIGGEST_PROFIT; // Какую позицию закрывать
 input int              InpPartialCooldownSec = 600;          // Кулдаун между частичными закрытиями, сек
 
 input group "=== Информация / лог ==="
@@ -838,11 +840,13 @@ bool ShouldUnlockHedge()
 //================== Частичное закрытие на откате (v1.10) ==========
 
 //--- Найти позицию-цель для частичного закрытия. side: +1=среди Buy, -1=среди Sell, 0=любая
+//    Если InpPartialOnlyProfitable=true — рассматриваются только позиции в плюсе.
 ulong PickPartialCloseTicket(const int side)
   {
    ulong best = 0;
    double bestVol = 0.0;
    double bestLoss = DBL_MAX; // самый отрицательный PnL
+   double bestProfit = -DBL_MAX; // самый положительный PnL
    datetime bestFirst = D'2099.01.01';
    datetime bestLast  = 0;
 
@@ -862,12 +866,16 @@ ulong PickPartialCloseTicket(const int side)
       datetime t = (datetime)Pos.Time();
       ulong tk   = Pos.Ticket();
 
+      //--- (правка) фильтр «не закрывать в убыток»
+      if(InpPartialOnlyProfitable && pl < 0.0) continue;
+
       switch(InpPartialTarget)
         {
          case PCT_LARGEST_LOT:
             if(vol > bestVol) { bestVol = vol; best = tk; }
             break;
          case PCT_BIGGEST_LOSS:
+            //--- осмысленно только если InpPartialOnlyProfitable=false
             if(pl < bestLoss) { bestLoss = pl; best = tk; }
             break;
          case PCT_FIRST_OPENED:
@@ -875,6 +883,9 @@ ulong PickPartialCloseTicket(const int side)
             break;
          case PCT_LAST_OPENED:
             if(t > bestLast)  { bestLast = t; best = tk; }
+            break;
+         case PCT_BIGGEST_PROFIT:
+            if(pl > bestProfit) { bestProfit = pl; best = tk; }
             break;
         }
      }
@@ -911,6 +922,11 @@ void TryPartialClose(const BasketInfo &b)
      }
 
    ulong tk = PickPartialCloseTicket(side);
+   //--- (правка) если в выбранной стороне нет подходящей позиции (например,
+   //    InpPartialOnlyProfitable=true и все убыточные) — пробуем противоположную
+   if(tk == 0 && side != 0) tk = PickPartialCloseTicket(-side);
+   //--- ...и в крайнем случае — любую
+   if(tk == 0)              tk = PickPartialCloseTicket(0);
    if(tk == 0) return;
    if(Trade.PositionClose(tk))
      {
