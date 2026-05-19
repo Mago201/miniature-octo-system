@@ -26,9 +26,18 @@
 //|   * Брэйк-ивен после N усреднений (опционально).                 |
 //|                                                                  |
 //|  v1.00 — первая версия.                                          |
+//|  v1.10 — три новых блока:                                        |
+//|   * Хедж-лок: при достижении просадки открываем противоположную  |
+//|     позицию своим магиком, замораживая убыток. При откате на     |
+//|     N% от пика DD хедж снимается первым (расколачивание).        |
+//|   * Частичное закрытие: на «первом откате» от пика просадки      |
+//|     закрываем самую тяжёлую позицию (по выбору: max-лот /        |
+//|     max-убыток / первая / последняя), снижая нагрузку на счёт.   |
+//|   * Импорт сигналов EvasiveST_FBG: первый вход по ST-флипу,      |
+//|     по стрелке Герчика или по любому из них (через iCustom).     |
 //+------------------------------------------------------------------+
 #property copyright "Devin"
-#property version   "1.00"
+#property version   "1.10"
 #property description "Универсальный советник вытаскивания счёта из просадки (ATR-сетка, корзина TP, предохранители)"
 #property strict
 
@@ -66,6 +75,24 @@ enum ENUM_INITIAL_LOT_MODE
   {
    ILM_FIXED         = 0, // Фиксированный лот
    ILM_RISK_PCT      = 1  // % риска от баланса (по InpRiskStopPips)
+  };
+
+//--- Источник сигнала первого входа (v1.10)
+enum ENUM_ENTRY_TRIGGER
+  {
+   TRG_EMA          = 0, // EMA fast/slow тренд (как в v1.00)
+   TRG_FBG_ST_FLIP  = 1, // EvasiveST_FBG: только флип СуперТренда
+   TRG_FBG_ARROW    = 2, // EvasiveST_FBG: только стрелка Герчика
+   TRG_FBG_ANY      = 3  // EvasiveST_FBG: ST-флип ИЛИ стрелка Герчика
+  };
+
+//--- Что закрывать при частичном восстановлении (v1.10)
+enum ENUM_PARTIAL_TARGET
+  {
+   PCT_LARGEST_LOT   = 0, // Самая крупная по объёму
+   PCT_BIGGEST_LOSS  = 1, // С самым большим убытком
+   PCT_FIRST_OPENED  = 2, // Самая старая
+   PCT_LAST_OPENED   = 3  // Самая новая (последнее усреднение)
   };
 
 //================== Входные параметры ==============================
@@ -115,9 +142,32 @@ input bool             InpBreakevenAfterN    = true;         // Брэйк-ив�
 input int              InpAveragesForBE      = 3;            // N усреднений до брэйк-ивена
 
 input group "=== Трендовый фильтр (для авто-входа) ==="
-input int              InpFastEMA            = 50;           // Быстрая EMA
-input int              InpSlowEMA            = 200;          // Медленная EMA
+input ENUM_ENTRY_TRIGGER InpEntryTrigger     = TRG_EMA;      // Источник сигнала первого входа
+input int              InpFastEMA            = 50;           // Быстрая EMA (для TRG_EMA)
+input int              InpSlowEMA            = 200;          // Медленная EMA (для TRG_EMA)
 input ENUM_TIMEFRAMES  InpTrendTF            = PERIOD_H1;    // ТФ для EMA-фильтра
+
+input group "=== Импорт сигналов EvasiveST_FBG (v1.10) ==="
+input string           InpFBGIndicator       = "EvasiveST_FBG"; // Имя файла индикатора (без .ex5)
+input int              InpFBGSignalShift     = 1;            // Бар сигнала: 1=последний закрытый, 0=текущий
+input bool             InpFBGRespectIndicatorTrend = true;   // Сверять направление с InpDirection (например, TREND ⊕ FBG)
+
+input group "=== Хедж-лок (v1.10) ==="
+input bool             InpUseHedgeLock       = false;        // Включить хедж-лок (требуется хедж-счёт)
+input double           InpHedgeLockDDPct     = 5.0;          // % просадки для открытия хеджа
+input int              InpHedgeLockMinAvg    = 3;            // Мин. число усреднений на стороне до хеджа
+input double           InpHedgeLockRatio     = 1.0;          // Доля совокупного лота под хедж (1.0 = полный)
+input long             InpHedgeMagicOffset   = 1;            // Смещение магика для хеджа (Magic+offset)
+input double           InpHedgeUnlockDDPct   = 50.0;         // % восстановления от пика DD для расколачивания
+input bool             InpHedgeBlockAveraging = true;        // Запретить усреднение пока хедж активен
+
+input group "=== Частичное закрытие на откате (v1.10) ==="
+input bool             InpUsePartialClose    = false;        // Включить частичное закрытие
+input int              InpPartialMinAverages = 3;            // Мин. число усреднений на стороне
+input double           InpPartialMinDDPct    = 3.0;          // Мин. достигнутая просадка для активации
+input double           InpPartialRecoveryPct = 30.0;         // % восстановления от пика DD
+input ENUM_PARTIAL_TARGET InpPartialTarget   = PCT_BIGGEST_LOSS; // Какую позицию закрывать
+input int              InpPartialCooldownSec = 600;          // Кулдаун между частичными закрытиями, сек
 
 input group "=== Информация / лог ==="
 input bool             InpShowDashboard      = true;         // Панель состояния на графике
@@ -132,6 +182,7 @@ CAccountInfo     Acc;
 int              g_atrHandle = INVALID_HANDLE;
 int              g_emaFastHandle = INVALID_HANDLE;
 int              g_emaSlowHandle = INVALID_HANDLE;
+int              g_fbgHandle = INVALID_HANDLE;     // (v1.10) iCustom EvasiveST_FBG
 
 datetime         g_dayStart = 0;
 double           g_dayStartBalance = 0.0;
@@ -141,7 +192,18 @@ bool             g_equityStopHit = false;
 double           g_pip = 0.0;     // размер «пункта трейдера» (с учётом 3/5-знаков)
 int              g_pipDigits = 0; // 1 если 3/5-знаков, иначе 0
 
+//--- (v1.10) Хедж-лок
+bool             g_hedgeActive = false;
+int              g_hedgeSide   = 0;     // +1 хедж BUY (защищает Sell-корзину), -1 хедж SELL
+double           g_hedgeLot    = 0.0;
+double           g_hedgePeakDD = 0.0;   // пиковая просадка с момента активации хеджа
+
+//--- (v1.10) Трек пика DD для частичного закрытия
+double           g_basketPeakDD = 0.0;
+datetime         g_lastPartialCloseTime = 0;
+
 const string     DASH_NAME = "DDRescue_Dashboard";
+const string     HEDGE_TAG = "HDG"; // маркер в комментарии хедж-позиции
 
 //================== Утилиты ========================================
 
@@ -259,7 +321,9 @@ void GetBasket(BasketInfo &b)
       if(Pos.Symbol() != _Symbol) continue;
 
       bool ours = (Pos.Magic() == InpMagic);
-      bool manual = (Pos.Magic() != InpMagic);
+      bool isHedge = (Pos.Magic() == HedgeMagic());
+      bool manual = (Pos.Magic() != InpMagic && !isHedge);
+      if(isHedge) continue; // (v1.10) хедж учитывается отдельно
       if(!ours && !(InpManageManualTrades && manual)) continue;
 
       double vol  = Pos.Volume();
@@ -302,7 +366,9 @@ bool CloseAllOurs(const string reason)
       if(!Pos.SelectByIndex(i)) continue;
       if(Pos.Symbol() != _Symbol) continue;
       bool ours = (Pos.Magic() == InpMagic);
-      bool manual = (Pos.Magic() != InpMagic);
+      bool isHedge = (Pos.Magic() == HedgeMagic());
+      bool manual = (Pos.Magic() != InpMagic && !isHedge);
+      if(isHedge) continue; // (v1.10) хедж закрывается отдельно через CloseAllHedges
       if(!ours && !(InpManageManualTrades && manual)) continue;
       ulong ticket = Pos.Ticket();
       if(!Trade.PositionClose(ticket))
@@ -436,18 +502,34 @@ bool OpenMarket(const int side, const double lot, const string why)
 
 //================== Решение о входе ===============================
 
-//--- Разрешённое направление по настройкам и тренду
+//--- Сигнальная сторона по выбранному источнику (EMA или FBG-индикатор)
+//    Возвращает +1 / -1 / 0
+int SignalSide()
+  {
+   if(InpEntryTrigger == TRG_EMA) return GetTrendSide();
+   return FBGSignalSide(); // FBG_ST_FLIP / FBG_ARROW / FBG_ANY
+  }
+
+//--- Разрешённое направление по настройкам и сигналу источника
 //    Возвращает +1, -1 или 0 (запрещено / нейтрально)
 int AllowedSide()
   {
-   int trend = GetTrendSide();
+   int sig = SignalSide();
+   //--- Если выбран FBG и пользователь не хочет «дополнительной» фильтрации —
+   //    возвращаем сторону прямо из индикатора без модификации (BUY_ONLY/SELL_ONLY всё равно держим).
+   if(InpEntryTrigger != TRG_EMA && !InpFBGRespectIndicatorTrend)
+     {
+      if(InpDirection == RDIR_BUY_ONLY)  return (sig > 0) ? +1 : 0;
+      if(InpDirection == RDIR_SELL_ONLY) return (sig < 0) ? -1 : 0;
+      return sig;
+     }
    switch(InpDirection)
      {
-      case RDIR_BUY_ONLY:  return +1;
-      case RDIR_SELL_ONLY: return -1;
-      case RDIR_TREND:     return trend;
-      case RDIR_COUNTER:   return -trend;
-      case RDIR_BOTH:      return (trend == 0) ? +1 : trend;
+      case RDIR_BUY_ONLY:  return (sig >= 0) ? +1 : 0;
+      case RDIR_SELL_ONLY: return (sig <= 0) ? -1 : 0;
+      case RDIR_TREND:     return sig;
+      case RDIR_COUNTER:   return -sig;
+      case RDIR_BOTH:      return (sig == 0) ? +1 : sig;
      }
    return 0;
   }
@@ -455,6 +537,10 @@ int AllowedSide()
 //--- Условие открытия N-го усреднения для стороны
 bool ShouldAverage(const int side, const BasketInfo &b)
   {
+   //--- (v1.10) При активном хедж-локе усреднение запрещено,
+   //    пока не сработал расколачивающий триггер.
+   if(g_hedgeActive && InpHedgeBlockAveraging) return false;
+
    // Требуем активацию режима спасения по просадке
    double balance = Acc.Balance();
    double equity  = Acc.Equity();
@@ -548,6 +634,299 @@ bool SpreadOk()
    return (s <= (double)InpMaxSpreadPts);
   }
 
+//================== EvasiveST_FBG: импорт сигналов (v1.10) =========
+
+//--- Прочитать значение указанного буфера индикатора на заданном баре.
+//    Возвращает EMPTY_VALUE при ошибке.
+double FBGBuffer(const int bufferIndex, const int shift)
+  {
+   if(g_fbgHandle == INVALID_HANDLE) return EMPTY_VALUE;
+   double v[];
+   if(CopyBuffer(g_fbgHandle, bufferIndex, shift, 1, v) != 1) return EMPTY_VALUE;
+   return v[0];
+  }
+
+//--- Сторона сигнала индикатора по выбранному источнику.
+//    +1 / -1 / 0 (нет сигнала)
+int FBGSignalSide()
+  {
+   if(g_fbgHandle == INVALID_HANDLE) return 0;
+   int s = MathMax(0, InpFBGSignalShift);
+
+   //--- индексы буферов EvasiveST_FBG (см. описание индикатора):
+   //    4=ST Bull, 5=ST Bear, 11=FBG Buy, 12=FBG Sell
+   double stBull = FBGBuffer(4,  s);
+   double stBear = FBGBuffer(5,  s);
+   double fbgBuy = FBGBuffer(11, s);
+   double fbgSel = FBGBuffer(12, s);
+
+   bool bullST  = (stBull  != EMPTY_VALUE && stBull  != 0.0);
+   bool bearST  = (stBear  != EMPTY_VALUE && stBear  != 0.0);
+   bool bullFBG = (fbgBuy  != EMPTY_VALUE && fbgBuy  != 0.0);
+   bool bearFBG = (fbgSel  != EMPTY_VALUE && fbgSel  != 0.0);
+
+   bool bull=false, bear=false;
+   switch(InpEntryTrigger)
+     {
+      case TRG_FBG_ST_FLIP: bull = bullST;            bear = bearST;            break;
+      case TRG_FBG_ARROW:   bull = bullFBG;           bear = bearFBG;           break;
+      case TRG_FBG_ANY:     bull = bullST || bullFBG; bear = bearST || bearFBG; break;
+      default:              return 0; // TRG_EMA — не наш режим
+     }
+   if(bull && !bear) return +1;
+   if(bear && !bull) return -1;
+   return 0;
+  }
+
+//================== Хедж-лок (v1.10) ===============================
+
+long HedgeMagic() { return InpMagic + InpHedgeMagicOffset; }
+
+//--- Сканирование позиций по хедж-магику
+void GetHedgeBasket(int &count, double &lot, int &side, double &pl)
+  {
+   count = 0; lot = 0.0; side = 0; pl = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+     {
+      if(!Pos.SelectByIndex(i)) continue;
+      if(Pos.Symbol() != _Symbol) continue;
+      if(Pos.Magic()  != HedgeMagic()) continue;
+      count++;
+      lot += Pos.Volume();
+      side = (Pos.PositionType() == POSITION_TYPE_BUY) ? +1 : -1;
+      pl  += Pos.Profit() + Pos.Swap() + Pos.Commission();
+     }
+  }
+
+bool IsHedgingAccount()
+  {
+   long mode = AccountInfoInteger(ACCOUNT_MARGIN_MODE);
+   return (mode == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING);
+  }
+
+//--- Открыть хедж-позицию своим магиком
+bool OpenHedge(const int side, const double lot)
+  {
+   if(lot <= 0.0) return false;
+   if(!IsHedgingAccount())
+     {
+      Print("[DDRescue] Хедж-лок невозможен: счёт в режиме неттинга");
+      return false;
+     }
+   Trade.SetExpertMagicNumber(HedgeMagic());
+   Sym.RefreshRates();
+   double price = (side > 0) ? Sym.Ask() : Sym.Bid();
+   string cmt = StringFormat("%s|%s", InpTradeComment, HEDGE_TAG);
+   bool ok = (side > 0) ? Trade.Buy(lot, _Symbol, price, 0.0, 0.0, cmt)
+                        : Trade.Sell(lot, _Symbol, price, 0.0, 0.0, cmt);
+   Trade.SetExpertMagicNumber(InpMagic); // вернули обычный магик
+   if(!ok)
+      PrintFormat("[DDRescue] Открытие хеджа %s lot=%.2f не удалось: %s",
+                  (side > 0) ? "BUY" : "SELL", lot, Trade.ResultRetcodeDescription());
+   else
+      PrintFormat("[DDRescue] HEDGE OPEN %s lot=%.2f price=%.5f",
+                  (side > 0) ? "BUY" : "SELL", lot, price);
+   return ok;
+  }
+
+//--- Закрыть все хедж-позиции
+bool CloseAllHedges(const string reason)
+  {
+   bool ok = true;
+   bool anyClosed = false;
+   Trade.SetExpertMagicNumber(HedgeMagic());
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+     {
+      if(!Pos.SelectByIndex(i)) continue;
+      if(Pos.Symbol() != _Symbol) continue;
+      if(Pos.Magic()  != HedgeMagic()) continue;
+      anyClosed = true;
+      if(!Trade.PositionClose(Pos.Ticket()))
+        {
+         PrintFormat("[DDRescue] Закрытие хеджа #%I64u не удалось: %s",
+                     Pos.Ticket(), Trade.ResultRetcodeDescription());
+         ok = false;
+        }
+     }
+   Trade.SetExpertMagicNumber(InpMagic);
+   if(ok && anyClosed) PrintFormat("[DDRescue] HEDGES CLOSED: %s", reason);
+   return ok;
+  }
+
+//--- Обновление состояния хеджа: фиксируем активность по факту наличия позиций
+void RefreshHedgeState()
+  {
+   int hcount; double hlot; int hside; double hpl;
+   GetHedgeBasket(hcount, hlot, hside, hpl);
+   bool wasActive = g_hedgeActive;
+   g_hedgeActive = (hcount > 0);
+   g_hedgeLot    = hlot;
+   g_hedgeSide   = hside;
+   if(g_hedgeActive && !wasActive)
+     {
+      // Хедж только что появился (или восстановлен после рестарта) — сбросим пик
+      double balance = Acc.Balance();
+      double equity  = Acc.Equity();
+      g_hedgePeakDD = (balance > 0.0) ? (balance - equity) * 100.0 / balance : 0.0;
+     }
+   if(!g_hedgeActive)
+     {
+      g_hedgeLot = 0.0;
+      g_hedgeSide = 0;
+     }
+  }
+
+//--- Решение об открытии хеджа
+//    side — сторона КОРЗИНЫ, которую нужно защитить (та, где сейчас убыток).
+//    Хедж открывается в противоположную сторону.
+bool ShouldOpenHedge(const BasketInfo &b, int &trappedSide)
+  {
+   trappedSide = 0;
+   if(!InpUseHedgeLock) return false;
+   if(g_hedgeActive)    return false;
+   if(!IsHedgingAccount()) return false;
+
+   double balance = Acc.Balance();
+   double equity  = Acc.Equity();
+   if(balance <= 0.0) return false;
+   double ddPct = (balance - equity) * 100.0 / balance;
+   if(ddPct < InpHedgeLockDDPct) return false;
+
+   // Какая сторона убыточна? Та, где плавающий PnL по своей стороне самый отрицательный
+   // и где есть достаточно усреднений.
+   double buyPL = 0.0, sellPL = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+     {
+      if(!Pos.SelectByIndex(i)) continue;
+      if(Pos.Symbol() != _Symbol) continue;
+      if(Pos.Magic() != InpMagic && !(InpManageManualTrades && Pos.Magic() != HedgeMagic())) continue;
+      if(Pos.Magic() == HedgeMagic()) continue;
+      double pl = Pos.Profit() + Pos.Swap() + Pos.Commission();
+      if(Pos.PositionType() == POSITION_TYPE_BUY)  buyPL  += pl;
+      else                                          sellPL += pl;
+     }
+   if(buyPL >= 0.0 && sellPL >= 0.0) return false;
+
+   if(buyPL <= sellPL && b.buyCount  >= InpHedgeLockMinAvg) trappedSide = +1;
+   else if(b.sellCount >= InpHedgeLockMinAvg)               trappedSide = -1;
+   else return false;
+   return true;
+  }
+
+//--- Размер хеджа: ratio * (совокупный лот защищаемой стороны)
+double HedgeLotFor(const int trappedSide, const BasketInfo &b)
+  {
+   double base = (trappedSide > 0) ? b.buyLots : b.sellLots;
+   double lot = base * MathMax(0.1, InpHedgeLockRatio);
+   return NormalizeLot(lot);
+  }
+
+//--- Условия снятия хеджа: восстановление от пика DD на InpHedgeUnlockDDPct%
+bool ShouldUnlockHedge()
+  {
+   if(!g_hedgeActive) return false;
+   double balance = Acc.Balance();
+   double equity  = Acc.Equity();
+   if(balance <= 0.0) return false;
+   double ddPct = (balance - equity) * 100.0 / balance;
+   if(ddPct > g_hedgePeakDD) g_hedgePeakDD = ddPct;
+   if(g_hedgePeakDD <= 0.0)  return false;
+   double recovered = (g_hedgePeakDD - ddPct) * 100.0 / g_hedgePeakDD;
+   return (recovered >= InpHedgeUnlockDDPct);
+  }
+
+//================== Частичное закрытие на откате (v1.10) ==========
+
+//--- Найти позицию-цель для частичного закрытия. side: +1=среди Buy, -1=среди Sell, 0=любая
+ulong PickPartialCloseTicket(const int side)
+  {
+   ulong best = 0;
+   double bestVol = 0.0;
+   double bestLoss = DBL_MAX; // самый отрицательный PnL
+   datetime bestFirst = D'2099.01.01';
+   datetime bestLast  = 0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+     {
+      if(!Pos.SelectByIndex(i)) continue;
+      if(Pos.Symbol() != _Symbol) continue;
+      bool ours   = (Pos.Magic() == InpMagic);
+      bool manual = (Pos.Magic() != InpMagic && Pos.Magic() != HedgeMagic());
+      if(!ours && !(InpManageManualTrades && manual)) continue;
+
+      int psd = (Pos.PositionType() == POSITION_TYPE_BUY) ? +1 : -1;
+      if(side != 0 && psd != side) continue;
+
+      double vol = Pos.Volume();
+      double pl  = Pos.Profit() + Pos.Swap() + Pos.Commission();
+      datetime t = (datetime)Pos.Time();
+      ulong tk   = Pos.Ticket();
+
+      switch(InpPartialTarget)
+        {
+         case PCT_LARGEST_LOT:
+            if(vol > bestVol) { bestVol = vol; best = tk; }
+            break;
+         case PCT_BIGGEST_LOSS:
+            if(pl < bestLoss) { bestLoss = pl; best = tk; }
+            break;
+         case PCT_FIRST_OPENED:
+            if(t < bestFirst) { bestFirst = t; best = tk; }
+            break;
+         case PCT_LAST_OPENED:
+            if(t > bestLast)  { bestLast = t; best = tk; }
+            break;
+        }
+     }
+   return best;
+  }
+
+//--- Решение о частичном закрытии и его исполнение
+void TryPartialClose(const BasketInfo &b)
+  {
+   if(!InpUsePartialClose) return;
+   if(g_hedgeActive) return; // во время хедж-лока работает unlock-логика
+   int total = b.buyCount + b.sellCount;
+   if(total < InpPartialMinAverages + 1) return;
+   if(g_basketPeakDD < InpPartialMinDDPct) return;
+   if(InpPartialCooldownSec > 0
+      && g_lastPartialCloseTime > 0
+      && (TimeCurrent() - g_lastPartialCloseTime) < InpPartialCooldownSec) return;
+
+   double balance = Acc.Balance();
+   double equity  = Acc.Equity();
+   double ddPct   = (balance > 0.0) ? (balance - equity) * 100.0 / balance : 0.0;
+   if(g_basketPeakDD <= 0.0) return;
+   double recovered = (g_basketPeakDD - ddPct) * 100.0 / g_basketPeakDD;
+   if(recovered < InpPartialRecoveryPct) return;
+
+   // Закрываем по «трапнутой» стороне (где больше убытка); если стороны равны — любую
+   int side = 0;
+   if(b.buyCount > 0 && b.sellCount == 0) side = +1;
+   else if(b.sellCount > 0 && b.buyCount == 0) side = -1;
+   else
+     {
+      // выберем сторону с большим лотом — там обычно больше убытка
+      side = (b.buyLots >= b.sellLots) ? +1 : -1;
+     }
+
+   ulong tk = PickPartialCloseTicket(side);
+   if(tk == 0) return;
+   if(Trade.PositionClose(tk))
+     {
+      g_lastPartialCloseTime = TimeCurrent();
+      // После частичного закрытия сбрасываем пик DD — теперь корзина «легче»
+      g_basketPeakDD = ddPct;
+      PrintFormat("[DDRescue] PARTIAL CLOSE ticket=%I64u side=%s recovered=%.2f%% peakDD=%.2f%%",
+                  tk, (side > 0) ? "BUY" : "SELL", recovered, g_basketPeakDD);
+     }
+   else
+     {
+      PrintFormat("[DDRescue] PARTIAL CLOSE failed ticket=%I64u: %s",
+                  tk, Trade.ResultRetcodeDescription());
+     }
+  }
+
 //================== Дашборд ========================================
 void UpdateDashboard(const BasketInfo &b)
   {
@@ -565,15 +944,18 @@ void UpdateDashboard(const BasketInfo &b)
    string trendTxt = (trend > 0) ? "Up" : (trend < 0) ? "Dn" : "--";
 
    string txt = StringFormat(
-      "DDRescue v1.00\n"
-      "Balance: %.2f  Equity: %.2f  DD: %.2f%%\n"
+      "DDRescue v1.10\n"
+      "Balance: %.2f  Equity: %.2f  DD: %.2f%%  PeakDD: %.2f%%\n"
       "Buy: %d (%.2f lot @ %.*f)   Sell: %d (%.2f lot @ %.*f)\n"
       "Floating: %.2f  Trend: %s  ATR: %.*f  Step: %.*f\n"
-      "EquityStop: %s  DailyLimit: %s",
-      balance, equity, ddPct,
+      "Hedge: %s  EquityStop: %s  DailyLimit: %s",
+      balance, equity, ddPct, g_basketPeakDD,
       b.buyCount, b.buyLots, _Digits, b.buyVwap,
       b.sellCount, b.sellLots, _Digits, b.sellVwap,
       b.floatingPL, trendTxt, _Digits, atr, _Digits, step,
+      g_hedgeActive
+         ? StringFormat("%s %.2f", (g_hedgeSide > 0) ? "BUY" : "SELL", g_hedgeLot)
+         : "off",
       g_equityStopHit ? "HIT" : "ok",
       g_dailyLimitHit ? "HIT" : "ok");
 
@@ -625,9 +1007,27 @@ int OnInit()
       return INIT_FAILED;
      }
 
+   //--- (v1.10) iCustom EvasiveST_FBG — нужен только если выбран FBG-триггер.
+   //    Используем дефолтные параметры индикатора. Если хотите собственные —
+   //    добавьте их явно после имени файла (см. документацию iCustom).
+   if(InpEntryTrigger != TRG_EMA)
+     {
+      g_fbgHandle = iCustom(_Symbol, _Period, InpFBGIndicator);
+      if(g_fbgHandle == INVALID_HANDLE)
+        {
+         PrintFormat("[DDRescue] iCustom('%s') failed, err=%d. "
+                     "Положите %s.ex5 в MQL5/Indicators и перекомпилируйте.",
+                     InpFBGIndicator, GetLastError(), InpFBGIndicator);
+         return INIT_FAILED;
+        }
+     }
+
    RolloverDailyState();
-   PrintFormat("[DDRescue] Старт. Symbol=%s Digits=%d Pip=%.*f Magic=%I64d",
-               _Symbol, _Digits, _Digits, g_pip, InpMagic);
+   //--- (v1.10) Восстановим состояние хеджа после рестарта
+   RefreshHedgeState();
+   PrintFormat("[DDRescue] Старт. Symbol=%s Digits=%d Pip=%.*f Magic=%I64d HedgeMagic=%I64d EntryTrig=%s",
+               _Symbol, _Digits, _Digits, g_pip, InpMagic, HedgeMagic(),
+               EnumToString(InpEntryTrigger));
    return INIT_SUCCEEDED;
   }
 
@@ -636,6 +1036,7 @@ void OnDeinit(const int reason)
    if(g_atrHandle    != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
    if(g_emaFastHandle != INVALID_HANDLE) IndicatorRelease(g_emaFastHandle);
    if(g_emaSlowHandle != INVALID_HANDLE) IndicatorRelease(g_emaSlowHandle);
+   if(g_fbgHandle    != INVALID_HANDLE) IndicatorRelease(g_fbgHandle);
    if(ObjectFind(0, DASH_NAME) >= 0) ObjectDelete(0, DASH_NAME);
   }
 
@@ -646,6 +1047,17 @@ void OnTick()
 
    BasketInfo b;
    GetBasket(b);
+
+   //--- (v1.10) Обновим состояние хеджа и пиковую просадку корзины
+   RefreshHedgeState();
+   {
+      double balance = Acc.Balance();
+      double equity  = Acc.Equity();
+      double ddPct = (balance > 0.0) ? (balance - equity) * 100.0 / balance : 0.0;
+      // Пик DD ведём только пока есть позиции; после полного закрытия — обнуляется
+      if(b.buyCount + b.sellCount == 0) g_basketPeakDD = 0.0;
+      else if(ddPct > g_basketPeakDD)   g_basketPeakDD = ddPct;
+   }
 
    //--- Предохранители (даже если EquityStop уже сработал — мониторим)
    if(CheckEquityStop()) { UpdateDashboard(b); return; }
@@ -659,6 +1071,7 @@ void OnTick()
         {
          if(InpVerboseLog) Print("[DDRescue] TP корзины достигнут — закрываю всё");
          CloseAllOurs("basket-tp");
+         CloseAllHedges("basket-tp");
          GetBasket(b);
          UpdateDashboard(b);
          return;
@@ -667,11 +1080,40 @@ void OnTick()
         {
          if(InpVerboseLog) Print("[DDRescue] Брэйк-ивен достигнут — закрываю всё");
          CloseAllOurs("breakeven");
+         CloseAllHedges("breakeven");
          GetBasket(b);
          UpdateDashboard(b);
          return;
         }
      }
+
+   //--- (v1.10) Хедж-лок: расколачивание (закрываем хедж первым при восстановлении)
+   if(g_hedgeActive && ShouldUnlockHedge())
+     {
+      Print("[DDRescue] Снятие хеджа: цена откатилась, восстановление достигнуто");
+      CloseAllHedges("unlock");
+      RefreshHedgeState();
+      // После снятия хеджа сбросим пик DD корзины — теперь работаем «по-новой»
+      double balance = Acc.Balance();
+      double equity  = Acc.Equity();
+      g_basketPeakDD = (balance > 0.0) ? (balance - equity) * 100.0 / balance : 0.0;
+     }
+
+   //--- (v1.10) Хедж-лок: открытие при глубокой просадке
+   if(InpUseHedgeLock && !g_hedgeActive)
+     {
+      int trapped = 0;
+      if(ShouldOpenHedge(b, trapped) && trapped != 0)
+        {
+         double hlot = HedgeLotFor(trapped, b);
+         // Хедж в противоположную сторону
+         if(OpenHedge(-trapped, hlot)) RefreshHedgeState();
+        }
+     }
+
+   //--- (v1.10) Частичное закрытие на откате
+   TryPartialClose(b);
+   GetBasket(b);
 
    //--- Если активен глобальный запрет — выходим из логики открытий
    if(g_equityStopHit) { UpdateDashboard(b); return; }
@@ -696,7 +1138,8 @@ void OnTick()
      }
 
    //--- Первый вход (если включён авто-режим и нет позиций нашего магика на стороне)
-   if(InpAutoTradeFirst)
+   //    При активном хедже новых первых входов не делаем.
+   if(InpAutoTradeFirst && !g_hedgeActive)
      {
       // Не торгуем, если уже есть позиции (включая ручные при manage=on)
       bool noBuys  = (b.buyCount  == 0);
