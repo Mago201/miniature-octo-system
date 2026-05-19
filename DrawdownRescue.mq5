@@ -37,8 +37,8 @@
 //|     по стрелке Герчика или по любому из них (через iCustom).     |
 //+------------------------------------------------------------------+
 #property copyright "Devin"
-#property version   "1.10"
-#property description "Универсальный советник вытаскивания счёта из просадки (ATR-сетка, корзина TP, предохранители)"
+#property version   "1.20"
+#property description "Универсальный советник вытаскивания счёта из просадки (ATR-сетка, корзина TP, хедж-лок с парным расколачиванием)"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -161,6 +161,13 @@ input double           InpHedgeLockRatio     = 1.0;          // Доля сов�
 input long             InpHedgeMagicOffset   = 1;            // Смещение магика для хеджа (Magic+offset)
 input double           InpHedgeUnlockDDPct   = 50.0;         // % восстановления от пика DD для расколачивания
 input bool             InpHedgeBlockAveraging = true;        // Запретить усреднение пока хедж активен
+
+input group "=== Парное расколачивание лока (v1.20) ==="
+input bool             InpUseUnlockPairs     = true;         // Закрывать пары (хедж + корзина) парами без убытка
+input double           InpUnlockPairMinProfitMoney = 0.0;    // Мин. прибыль пары после закрытия (валюта депо)
+input double           InpUnlockSafetyMoney  = 1.0;          // Резерв на проскальзывание (валюта депо)
+input bool             InpHedgeCloseOnlyInProfit = true;     // Закрывать хедж полностью ТОЛЬКО если он в плюсе
+input double           InpHedgeMinProfitToClose = 0.0;       // Мин. прибыль хеджа для его закрытия (валюта депо)
 
 input group "=== Частичное закрытие на откате (v1.10) ==="
 input bool             InpUsePartialClose    = false;        // Включить частичное закрытие
@@ -823,21 +830,146 @@ double HedgeLotFor(const int trappedSide, const BasketInfo &b)
    return NormalizeLot(lot);
   }
 
-//--- Условия снятия хеджа: восстановление от пика DD на InpHedgeUnlockDDPct%
+//--- Условия снятия хеджа полностью.
+//    (v1.20) По умолчанию хедж закрывается только если ОН САМ в плюсе на
+//    InpHedgeMinProfitToClose. Закрытие хеджа в минус считается реализацией
+//    убытка и запрещено пользовательской политикой. Старая логика
+//    «восстановление от пика DD» осталась как дополнительное условие.
 bool ShouldUnlockHedge()
   {
    if(!g_hedgeActive) return false;
+
+   //--- (v1.20) текущий PnL хеджа
+   int hcount; double hlot; int hside; double hpl;
+   GetHedgeBasket(hcount, hlot, hside, hpl);
+   if(hcount == 0) return false;
+
+   //--- (v1.20) основное условие: хедж сам в плюсе
+   if(InpHedgeCloseOnlyInProfit && hpl < InpHedgeMinProfitToClose) return false;
+
+   //--- (v1.10) дополнительное условие "восстановление от пика DD" — оставлено
+   //    для совместимости. Если хедж уже в плюсе (или фильтр выключен) и DD
+   //    ещё не восстановилась — всё равно можно закрыть, потому что это плюс.
    double balance = Acc.Balance();
    double equity  = Acc.Equity();
-   if(balance <= 0.0) return false;
+   if(balance <= 0.0) return true;
    double ddPct = (balance - equity) * 100.0 / balance;
    if(ddPct > g_hedgePeakDD) g_hedgePeakDD = ddPct;
-   if(g_hedgePeakDD <= 0.0)  return false;
-   double recovered = (g_hedgePeakDD - ddPct) * 100.0 / g_hedgePeakDD;
-   return (recovered >= InpHedgeUnlockDDPct);
+   return true;
   }
 
-//================== Частичное закрытие на откате (v1.10) ==========
+//--- (v1.20) Получить тикет хедж-позиции (она у нас одна) и её данные
+ulong GetHedgeTicket(double &hpl, double &hvol, int &hside)
+  {
+   hpl = 0.0; hvol = 0.0; hside = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+     {
+      if(!Pos.SelectByIndex(i)) continue;
+      if(Pos.Symbol() != _Symbol) continue;
+      if(Pos.Magic()  != HedgeMagic()) continue;
+      hpl  = Pos.Profit() + Pos.Swap() + Pos.Commission();
+      hvol = Pos.Volume();
+      hside = (Pos.PositionType() == POSITION_TYPE_BUY) ? +1 : -1;
+      return Pos.Ticket();
+     }
+   return 0;
+  }
+
+//--- (v1.20) ПАРНОЕ РАСКОЛАЧИВАНИЕ ЛОКА.
+//    Когда хедж в плюсе, ищем корзинную позицию (любой стороны кроме хедж-стороны),
+//    у которой убыток ≤ (прибыль хеджа − резерв − мин. прибыль пары). Закрываем
+//    обе одновременно: хедж частично на объём корзинной, корзинную — полностью.
+//    Сумма пары после закрытия гарантированно >= 0 (минимум — InpUnlockPairMinProfitMoney).
+//    Если в корзине нашлась плюсовая позиция, выбираем её (закрываем без условия
+//    на резерв — двойной плюс ещё лучше).
+//    Возвращает true, если выполнили закрытие пары на этом тике.
+bool TryUnlockPair()
+  {
+   if(!InpUseUnlockPairs) return false;
+   if(!g_hedgeActive)     return false;
+
+   double hpl, hvol; int hside;
+   ulong hticket = GetHedgeTicket(hpl, hvol, hside);
+   if(hticket == 0) return false;
+
+   //--- (v1.20) Хедж должен быть в плюсе с запасом
+   double available = hpl - InpUnlockSafetyMoney - InpUnlockPairMinProfitMoney;
+   if(available <= 0.0) return false; // на покрытие убытка корзинной позиции не хватает
+
+   //--- Ищем корзинную позицию противоположной хеджу стороны (= трапнутая сторона)
+   //    с такими свойствами:
+   //    - объём ≤ объёма хеджа (иначе не сможем закрыть хедж парным объёмом),
+   //    - PnL >= -available (убыток помещается в плюс хеджа),
+   //    - предпочитаем плюсовые, потом — самые "дешёвые" (минимальный убыток).
+   ulong bestTk = 0;
+   double bestVol = 0.0;
+   double bestPL  = -DBL_MAX;
+   int trappedSide = -hside;
+
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+     {
+      if(!Pos.SelectByIndex(i)) continue;
+      if(Pos.Symbol() != _Symbol) continue;
+      bool ours   = (Pos.Magic() == InpMagic);
+      bool manual = (Pos.Magic() != InpMagic && Pos.Magic() != HedgeMagic());
+      if(!ours && !(InpManageManualTrades && manual)) continue;
+
+      int psd = (Pos.PositionType() == POSITION_TYPE_BUY) ? +1 : -1;
+      if(psd != trappedSide) continue; // только трапнутую сторону
+
+      double vol = Pos.Volume();
+      if(vol > hvol + 1e-9) continue; // не закроем хедж парным объёмом
+
+      double pl  = Pos.Profit() + Pos.Swap() + Pos.Commission();
+      if(pl < -available) continue;   // убыток не покрывается прибылью хеджа
+
+      //--- Лучший = с максимальным PnL (предпочтение плюсовым)
+      if(pl > bestPL)
+        {
+         bestPL  = pl;
+         bestVol = vol;
+         bestTk  = Pos.Ticket();
+        }
+     }
+
+   if(bestTk == 0) return false;
+
+   //--- Закрываем пару: сначала корзинную целиком, потом хедж частично на объём корзинной
+   if(!Trade.PositionClose(bestTk))
+     {
+      PrintFormat("[DDRescue] UNLOCK pair: close basket #%I64u failed: %s",
+                  bestTk, Trade.ResultRetcodeDescription());
+      return false;
+     }
+
+   //--- Закрытие части хеджа объёмом bestVol
+   bool ok = false;
+   //--- Если объёмы равны — закрываем хедж целиком
+   if(MathAbs(hvol - bestVol) < 1e-9)
+     {
+      Trade.SetExpertMagicNumber(HedgeMagic());
+      ok = Trade.PositionClose(hticket);
+      Trade.SetExpertMagicNumber(InpMagic);
+     }
+   else
+     {
+      Trade.SetExpertMagicNumber(HedgeMagic());
+      ok = Trade.PositionClosePartial(hticket, NormalizeLot(bestVol));
+      Trade.SetExpertMagicNumber(InpMagic);
+     }
+   if(!ok)
+     {
+      PrintFormat("[DDRescue] UNLOCK pair: hedge close (vol=%.2f) failed: %s. "
+                  "ВНИМАНИЕ: корзинная позиция уже закрыта, хедж не уменьшен.",
+                  bestVol, Trade.ResultRetcodeDescription());
+      return true; // корзинную закрыли, парность нарушена — но это не убыток,
+                   // т.к. на следующем тике алгоритм снова попробует закрыть хедж.
+     }
+
+   PrintFormat("[DDRescue] UNLOCK PAIR: basket #%I64u (PnL=%.2f, vol=%.2f) + hedge %.2f лот (PnL part≈%.2f). Net pair PnL>=%.2f",
+               bestTk, bestPL, bestVol, bestVol, hpl * (bestVol/hvol), bestPL + hpl * (bestVol/hvol));
+   return true;
+  }
 
 //--- Найти позицию-цель для частичного закрытия. side: +1=среди Buy, -1=среди Sell, 0=любая
 //    Если InpPartialOnlyProfitable=true — рассматриваются только позиции в плюсе.
@@ -960,7 +1092,7 @@ void UpdateDashboard(const BasketInfo &b)
    string trendTxt = (trend > 0) ? "Up" : (trend < 0) ? "Dn" : "--";
 
    string txt = StringFormat(
-      "DDRescue v1.10\n"
+      "DDRescue v1.20\n"
       "Balance: %.2f  Equity: %.2f  DD: %.2f%%  PeakDD: %.2f%%\n"
       "Buy: %d (%.2f lot @ %.*f)   Sell: %d (%.2f lot @ %.*f)\n"
       "Floating: %.2f  Trend: %s  ATR: %.*f  Step: %.*f\n"
@@ -1083,7 +1215,14 @@ void OnTick()
    //--- Закрытие корзины при достижении целевой прибыли или брэйк-ивена
    if(b.buyCount + b.sellCount > 0)
      {
-      if(BasketHitTarget(b))
+      //--- (v1.20) При активном хедже учитываем его PnL: суммарный результат
+      //    закрытия (корзина + хедж) должен быть не хуже целевого, иначе
+      //    держим лок (хедж может быть в минусе и съесть весь TP корзины).
+      double hpl_chk=0.0; double hv_chk=0.0; int hs_chk=0;
+      if(g_hedgeActive) GetHedgeTicket(hpl_chk, hv_chk, hs_chk);
+      double combinedPL = b.floatingPL + hpl_chk;
+
+      if(BasketHitTarget(b) && (!g_hedgeActive || combinedPL >= TargetMoney(b)))
         {
          if(InpVerboseLog) Print("[DDRescue] TP корзины достигнут — закрываю всё");
          CloseAllOurs("basket-tp");
@@ -1092,7 +1231,7 @@ void OnTick()
          UpdateDashboard(b);
          return;
         }
-      if(BasketHitBreakeven(b))
+      if(BasketHitBreakeven(b) && (!g_hedgeActive || combinedPL >= 0.0))
         {
          if(InpVerboseLog) Print("[DDRescue] Брэйк-ивен достигнут — закрываю всё");
          CloseAllOurs("breakeven");
@@ -1100,6 +1239,19 @@ void OnTick()
          GetBasket(b);
          UpdateDashboard(b);
          return;
+        }
+     }
+
+   //--- (v1.20) Парное расколачивание лока: закрываем хедж и корзинную позицию
+   //    парами так, чтобы сумма пары была неотрицательной. Запускается при
+   //    активном хедже до проверки полного снятия — даёт шанс выйти из лока
+   //    постепенно без реализации убытков.
+   if(g_hedgeActive)
+     {
+      if(TryUnlockPair())
+        {
+         RefreshHedgeState();
+         GetBasket(b);
         }
      }
 
