@@ -56,6 +56,8 @@ input int              InpRiskCalcSLPts    = 300;           // Виртуаль�
 input double           InpMartingaleMult   = 2.0;           // Множитель лота после убытка
 input double           InpMartingaleMaxLot = 1.00;          // Максимальный лот при мартингейле
 input int              InpMaxLossesInRow   = 6;             // После N убытков подряд — сброс лота к базовому
+input bool             InpGridMartingale   = true;          // Сеточный мартингейл: каждый новый ордер в открытой сетке с увеличенным лотом
+input bool             InpGridFromBaseLot  = true;          // База для сеточного мартингейла: true=InpLotFixed, false=текущий g_currentLot
 
 input group "=== Цели и защита ==="
 input int              InpTakeProfitPts    = 80;            // Тейк-профит (в пунктах цены, 1 пункт=_Point)
@@ -198,8 +200,10 @@ int CountMyPositions(int &buyCnt, int &sellCnt)
 
 //+------------------------------------------------------------------+
 //| Расчёт лота                                                      |
+//|   openSameSide — сколько уже открыто позиций EA в ту же сторону, |
+//|   что и планируемый ордер. Используется для сеточного мартингейла|
 //+------------------------------------------------------------------+
-double CalcLot()
+double CalcLot(int openSameSide = 0)
   {
    double lot = InpLotFixed;
    switch(InpLotMode)
@@ -258,6 +262,18 @@ double CalcLot()
       case LOT_MARTINGALE:
          if(g_currentLot <= 0.0) g_currentLot = InpLotFixed;
          lot = g_currentLot;
+
+         // Сеточный мартингейл: множитель ^ (число уже открытых позиций той же стороны).
+         // Работает даже без SL — лот растёт по мере добора сетки.
+         if(InpGridMartingale && openSameSide > 0)
+           {
+            double base = InpGridFromBaseLot ? InpLotFixed : g_currentLot;
+            double mult = MathPow(InpMartingaleMult, (double)openSameSide);
+            lot = base * mult;
+            if(lot > InpMartingaleMaxLot) lot = InpMartingaleMaxLot;
+            PrintFormat("[Scalper] Сеточный мартингейл: уже открыто %d, база=%.2f x %.2f^%d -> %.2f",
+                        openSameSide, base, InpMartingaleMult, openSameSide, lot);
+           }
          break;
      }
    return NormalizeLot(lot);
@@ -398,11 +414,13 @@ int SignalDirection()
 
 //+------------------------------------------------------------------+
 //| Открытие позиции                                                 |
+//|   openSameSide — сколько уже открыто позиций EA той же стороны   |
+//|   (для прогрессивного/сеточного мартингейла)                     |
 //+------------------------------------------------------------------+
-bool OpenPosition(int dir)
+bool OpenPosition(int dir, int openSameSide = 0)
   {
    if(!g_sym.RefreshRates()) return false;
-   double lot = CalcLot();
+   double lot = CalcLot(openSameSide);
    if(lot <= 0.0) return false;
 
    // Явный лог режима лота — чтобы было видно, что мартингейл/риск работают.
@@ -412,8 +430,9 @@ bool OpenPosition(int dir)
       string mode = (InpLotMode == LOT_FIXED)      ? "FIXED"
                   : (InpLotMode == LOT_RISK_PCT)   ? "RISK_PCT"
                   : "MARTINGALE";
-      PrintFormat("[Scalper] CalcLot[%s] -> %.2f (база=%.2f, текущ.мартингейл=%.2f, серия убытков=%d)",
-                  mode, lot, InpLotFixed, g_currentLot, g_lossStreak);
+      PrintFormat("[Scalper] CalcLot[%s, sameSide=%d] -> %.2f (база=%.2f, текущ.мартингейл=%.2f, серия убытков=%d, gridMart=%s)",
+                  mode, openSameSide, lot, InpLotFixed, g_currentLot, g_lossStreak,
+                  (InpGridMartingale ? "ON" : "OFF"));
      }
    logCount++;
 
@@ -721,6 +740,9 @@ void OnTick()
    if(dir > 0 && buyCnt  >= InpMaxPositions) return;
    if(dir < 0 && sellCnt >= InpMaxPositions) return;
 
-   OpenPosition(dir);
+   // Передаём количество уже открытых позиций той же стороны —
+   // прогрессивный/сеточный мартингейл умножит лот на InpMartingaleMult^N.
+   int openSameSide = (dir > 0) ? buyCnt : sellCnt;
+   OpenPosition(dir, openSameSide);
   }
 //+------------------------------------------------------------------+
