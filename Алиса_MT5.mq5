@@ -49,6 +49,22 @@ enum ENUM_SIGNAL_SOURCE
    SIG_BOTH    = 2   // Оба источника
   };
 
+enum ENUM_SL_MODE
+  {
+   SL_FIXED_PTS    = 0,  // Фиксированный (в пунктах трейдера)
+   SL_ATR_LTF      = 1,  // Адаптивный: ATR текущего ТФ × множитель
+   SL_ATR_HTF      = 2,  // Адаптивный: ATR старшего ТФ × множитель
+   SL_SIGNAL_LEVEL = 3   // По уровню сигнала (хвост+буфер, как раньше)
+  };
+
+enum ENUM_TP_MODE
+  {
+   TP_FIXED_PTS    = 0,  // Фиксированный (в пунктах трейдера)
+   TP_ATR_LTF      = 1,  // ATR текущего ТФ × множитель
+   TP_ATR_HTF      = 2,  // ATR старшего ТФ × множитель
+   TP_NONE         = 3   // Без TP
+  };
+
 //================== Входные параметры — стратегия ====================
 input group "=== Источник сигналов ==="
 input ENUM_SIGNAL_SOURCE InpSigSource     = SIG_FBG;     // Источник торговых сигналов
@@ -100,9 +116,16 @@ input double             InpRiskPct        = 1.0;        // Риск (% бала
 input double             InpMaxLot         = 10.0;       // Жёсткий потолок лота
 
 input group "=== SL / TP ==="
-input double             InpSLBufferATR    = 0.25;       // Буфер SL за хвостом (xATR)
-input double             InpTPATR          = 2.0;        // TP в ATR от входа (0 — без TP)
-input double             InpFallbackSLATR  = 1.5;        // SL для ST-флипа (xATR)
+input ENUM_SL_MODE       InpSLMode         = SL_SIGNAL_LEVEL; // Режим стоп-лосса
+input int                InpSLFixedPts     = 300;        // SL фикс. (пункты трейдера) — для режима SL_FIXED_PTS
+input double             InpSLATRMult      = 1.5;        // SL множитель ATR — для SL_ATR_LTF и SL_ATR_HTF
+input ENUM_TIMEFRAMES    InpSL_HTF_TF      = PERIOD_H1;  // Старший ТФ для ATR стопа (SL_ATR_HTF)
+input int                InpSL_HTF_AtrPer  = 14;         // Период ATR на ст. ТФ для SL (SL_ATR_HTF)
+input double             InpSLBufferATR    = 0.25;       // Буфер SL за хвостом (xATR) — для SL_SIGNAL_LEVEL
+input ENUM_TP_MODE       InpTPMode         = TP_ATR_LTF; // Режим тейк-профита
+input int                InpTPFixedPts     = 600;        // TP фикс. (пункты трейдера) — для TP_FIXED_PTS
+input double             InpTPATR          = 2.0;        // TP множитель ATR — для TP_ATR_LTF / TP_ATR_HTF
+input double             InpFallbackSLATR  = 1.5;        // SL для ST-флипа при SL_SIGNAL_LEVEL (xATR)
 input bool               InpUseBreakeven   = true;       // Перевод в безубыток
 input double             InpBE_TriggerATR  = 1.0;        // Триггер БУ (прибыль в ATR)
 input double             InpBE_OffsetATR   = 0.10;       // Смещение БУ от входа (xATR)
@@ -656,41 +679,117 @@ bool CooldownAllows(const int sigIdx, const int side)
   }
 
 //+------------------------------------------------------------------+
-//| Расчёт цены SL/TP по сигналу                                     |
+//| Получить текущий ATR с заданного старшего ТФ (для SL/TP)          |
+//|   Считает ATR Уайлдера на последних InpSL_HTF_AtrPer барах.      |
+//|   Возвращает 0 при ошибке.                                       |
+//+------------------------------------------------------------------+
+double GetHTFAtrForSL()
+  {
+   int bars = Bars(_Symbol, InpSL_HTF_TF);
+   int need = InpSL_HTF_AtrPer + 2;
+   if(bars < need) return 0.0;
+   MqlRates r[];
+   int copied = CopyRates(_Symbol, InpSL_HTF_TF, 0, need, r);
+   if(copied < need) return 0.0;
+
+   int p = (InpSL_HTF_AtrPer < 1) ? 1 : InpSL_HTF_AtrPer;
+   double atr = 0.0, sum = 0.0;
+   for(int i = 1; i < copied; ++i)
+     {
+      double tr = TrueRange(r[i].high, r[i].low, r[i - 1].close);
+      if(i <= p)
+        {
+         sum += tr;
+         atr = sum / i;
+        }
+      else
+         atr = (atr * (p - 1.0) + tr) / p;
+     }
+   return atr;
+  }
+
+//+------------------------------------------------------------------+
+//| Расчёт цены SL/TP по сигналу с учётом ENUM_SL_MODE / TP_MODE    |
 //+------------------------------------------------------------------+
 void ComputeSLTP(const SignalInfo &sig, const double entry,
                  double &sl, double &tp)
   {
    sl = 0.0; tp = 0.0;
-   double atr = sig.atr;
-   if(atr <= 0.0) return;
+   double atr    = sig.atr;     // ATR текущего ТФ на баре сигнала
+   double pip    = PipSize();
 
-   if(sig.reason == "FBG" || sig.reason == "FBG_RETEST")
+   //=============== SL ===============
+   switch(InpSLMode)
      {
-      if(sig.side == 1)
+      case SL_FIXED_PTS:
         {
-         sl = sig.level - sig.tail - atr * InpSLBufferATR;
-         if(InpTPATR > 0.0) tp = entry + atr * InpTPATR;
+         double dist = (double)InpSLFixedPts * pip;
+         sl = (sig.side == 1) ? entry - dist : entry + dist;
+         break;
         }
-      else
+      case SL_ATR_LTF:
         {
-         sl = sig.level + sig.tail + atr * InpSLBufferATR;
-         if(InpTPATR > 0.0) tp = entry - atr * InpTPATR;
+         if(atr <= 0.0) break;
+         double dist = atr * InpSLATRMult;
+         sl = (sig.side == 1) ? entry - dist : entry + dist;
+         break;
+        }
+      case SL_ATR_HTF:
+        {
+         double htfAtr = GetHTFAtrForSL();
+         if(htfAtr <= 0.0) htfAtr = atr; // fallback на LTF
+         double dist = htfAtr * InpSLATRMult;
+         sl = (sig.side == 1) ? entry - dist : entry + dist;
+         break;
+        }
+      case SL_SIGNAL_LEVEL:
+      default:
+        {
+         if(atr <= 0.0) break;
+         if((sig.reason == "FBG" || sig.reason == "FBG_RETEST") && sig.level > 0.0)
+           {
+            if(sig.side == 1)
+               sl = sig.level - sig.tail - atr * InpSLBufferATR;
+            else
+               sl = sig.level + sig.tail + atr * InpSLBufferATR;
+           }
+         else // ST_FLIP — нет уровня; берём fallback
+           {
+            double dist = atr * InpFallbackSLATR;
+            sl = (sig.side == 1) ? entry - dist : entry + dist;
+           }
+         break;
         }
      }
-   else // ST_FLIP — нет уровня; берём ATR-стоп
+
+   //=============== TP ===============
+   switch(InpTPMode)
      {
-      double slDist = atr * InpFallbackSLATR;
-      if(sig.side == 1)
+      case TP_FIXED_PTS:
         {
-         sl = entry - slDist;
-         if(InpTPATR > 0.0) tp = entry + atr * InpTPATR;
+         double dist = (double)InpTPFixedPts * pip;
+         tp = (sig.side == 1) ? entry + dist : entry - dist;
+         break;
         }
-      else
+      case TP_ATR_LTF:
         {
-         sl = entry + slDist;
-         if(InpTPATR > 0.0) tp = entry - atr * InpTPATR;
+         if(atr <= 0.0) break;
+         tp = (sig.side == 1) ? entry + atr * InpTPATR
+                              : entry - atr * InpTPATR;
+         break;
         }
+      case TP_ATR_HTF:
+        {
+         double htfAtr = GetHTFAtrForSL(); // тот же ATR старшего ТФ
+         if(htfAtr <= 0.0) htfAtr = atr;
+         tp = (sig.side == 1) ? entry + htfAtr * InpTPATR
+                              : entry - htfAtr * InpTPATR;
+         break;
+        }
+      case TP_NONE:
+      default:
+         tp = 0.0;
+         break;
      }
   }
 
@@ -951,10 +1050,12 @@ int OnInit()
    g_htfLastUpdate = 0;
    g_htfCursor = 0;
 
-   Log(StringFormat("Запуск на %s %s | источник=%s | HTF=%s",
+   Log(StringFormat("Запуск на %s %s | источник=%s | HTF=%s | SL=%s | TP=%s",
        _Symbol, TfLabel((ENUM_TIMEFRAMES)_Period),
        EnumToString(InpSigSource),
-       InpUseHTF ? TfLabel(InpHTF) : "выкл"));
+       InpUseHTF ? TfLabel(InpHTF) : "выкл",
+       EnumToString(InpSLMode),
+       EnumToString(InpTPMode)));
    return INIT_SUCCEEDED;
   }
 
