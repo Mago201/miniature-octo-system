@@ -59,6 +59,9 @@ input int              InpMaxLossesInRow   = 6;             // После N уб
 input group "=== Цели и защита ==="
 input int              InpTakeProfitPts    = 80;            // Тейк-профит (в пунктах цены, 1 пункт=_Point)
 input int              InpStopLossPts      = 0;             // Стоп-лосс (0 — без SL)
+input bool             InpUseTotalTP       = true;          // Общий тейк-профит (по суммарной прибыли всех позиций)
+input double           InpTotalTPMoney     = 5.0;           // Целевая суммарная прибыль (валюта счёта) для закрытия всех
+input bool             InpTotalTPResetMart = true;          // Сброс мартингейла после общего тейка
 input bool             InpUseEquityStop    = true;          // Аварийный стоп по эквити
 input double           InpEquityStopPct    = 25.0;          // Просадка эквити, % от баланса — закрыть всё
 
@@ -483,6 +486,46 @@ void ManagePositions()
   }
 
 //+------------------------------------------------------------------+
+//| Общий тейк-профит: закрытие ВСЕХ позиций по суммарной прибыли   |
+//+------------------------------------------------------------------+
+bool CheckTotalTakeProfit()
+  {
+   if(!InpUseTotalTP) return false;
+
+   double totalProfit = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+     {
+      if(!g_pos.SelectByIndex(i)) continue;
+      if(g_pos.Symbol() != _Symbol) continue;
+      if(g_pos.Magic()  != InpMagic) continue;
+      totalProfit += g_pos.Profit() + g_pos.Swap() + g_pos.Commission();
+     }
+
+   if(totalProfit >= InpTotalTPMoney)
+     {
+      // Закрываем все позиции советника
+      for(int i = PositionsTotal() - 1; i >= 0; --i)
+        {
+         if(!g_pos.SelectByIndex(i)) continue;
+         if(g_pos.Symbol() != _Symbol) continue;
+         if(g_pos.Magic()  != InpMagic) continue;
+         g_trade.PositionClose(g_pos.Ticket());
+        }
+      PrintFormat("[Scalper] ОБЩИЙ ТЕЙК ДОСТИГНУТ: суммарная прибыль %.2f >= %.2f %s. Все позиции закрыты.",
+                  totalProfit, InpTotalTPMoney, AccountInfoString(ACCOUNT_CURRENCY));
+
+      // Опционально сбрасываем мартингейл после общего тейка
+      if(InpTotalTPResetMart)
+        {
+         g_currentLot = InpLotFixed;
+         g_lossStreak = 0;
+        }
+      return true;
+     }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
 //| Аварийный «капитальный» стоп                                     |
 //+------------------------------------------------------------------+
 void EquityGuard()
@@ -576,6 +619,9 @@ void OnTick()
   {
    // 1) защита эквити — первым делом
    EquityGuard();
+
+   // 1.5) общий тейк-профит — закрыть всё, если цель достигнута
+   if(CheckTotalTakeProfit()) return;
 
    // 2) актуализация мартингейла
    UpdateMartingaleFromHistory();
