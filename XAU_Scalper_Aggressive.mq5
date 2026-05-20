@@ -58,6 +58,7 @@ input double           InpMartingaleMaxLot = 1.00;          // Максимал�
 input int              InpMaxLossesInRow   = 6;             // После N убытков подряд — сброс лота к базовому
 input bool             InpGridMartingale   = true;          // Сеточный мартингейл: каждый новый ордер в открытой сетке с увеличенным лотом
 input bool             InpGridFromBaseLot  = true;          // База для сеточного мартингейла: true=InpLotFixed, false=текущий g_currentLot
+input int              InpGridStepOrders   = 1;             // Шаг увеличения лота: умножать каждые N ордеров сетки (1=каждый ордер, 2=каждый 2-й, ...)
 
 input group "=== Цели и защита ==="
 input int              InpTakeProfitPts    = 80;            // Тейк-профит (в пунктах цены, 1 пункт=_Point)
@@ -265,14 +266,19 @@ double CalcLot(int openSameSide = 0)
 
          // Сеточный мартингейл: множитель ^ (число уже открытых позиций той же стороны).
          // Работает даже без SL — лот растёт по мере добора сетки.
+         // InpGridStepOrders регулирует шаг прогрессии: при step=N лот умножается
+         // только каждые N ордеров (степень = floor(openSameSide / step)).
          if(InpGridMartingale && openSameSide > 0)
            {
             double base = InpGridFromBaseLot ? InpLotFixed : g_currentLot;
-            double mult = MathPow(InpMartingaleMult, (double)openSameSide);
+            int    step = (InpGridStepOrders > 0) ? InpGridStepOrders : 1;
+            int    expN = openSameSide / step; // целочисленное деление = floor
+            double mult = MathPow(InpMartingaleMult, (double)expN);
             lot = base * mult;
             if(lot > InpMartingaleMaxLot) lot = InpMartingaleMaxLot;
-            PrintFormat("[Scalper] Сеточный мартингейл: уже открыто %d, база=%.2f x %.2f^%d -> %.2f",
-                        openSameSide, base, InpMartingaleMult, openSameSide, lot);
+            PrintFormat("[Scalper] Сеточный мартингейл: уже открыто %d, шаг=%d, степень=%d, "
+                        "база=%.2f x %.2f^%d -> %.2f",
+                        openSameSide, step, expN, base, InpMartingaleMult, expN, lot);
            }
          break;
      }
