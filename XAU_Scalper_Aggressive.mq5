@@ -52,6 +52,7 @@ input group "=== Управление лотом ==="
 input ENUM_LOT_MODE    InpLotMode          = LOT_MARTINGALE;// Режим расчёта лота
 input double           InpLotFixed         = 0.01;          // Базовый/фиксированный лот
 input double           InpRiskPercent      = 1.0;           // Риск на сделку, % от баланса (для LOT_RISK_PCT)
+input int              InpRiskCalcSLPts    = 300;           // Виртуальный SL для расчёта риск-лота (пункты). 0 = брать InpStopLossPts
 input double           InpMartingaleMult   = 2.0;           // Множитель лота после убытка
 input double           InpMartingaleMaxLot = 1.00;          // Максимальный лот при мартингейле
 input int              InpMaxLossesInRow   = 6;             // После N убытков подряд — сброс лота к базовому
@@ -209,20 +210,48 @@ double CalcLot()
 
       case LOT_RISK_PCT:
         {
-         if(InpStopLossPts <= 0)
+         // Используем отдельный «виртуальный SL» для расчёта риска,
+         // чтобы режим работал даже когда реальный InpStopLossPts == 0.
+         int slForCalc = (InpRiskCalcSLPts > 0) ? InpRiskCalcSLPts : InpStopLossPts;
+         if(slForCalc <= 0)
            {
-            lot = InpLotFixed; // без SL риск-режим невозможен — фолбэк
+            static bool warnedNoSL = false;
+            if(!warnedNoSL)
+              {
+               Print("[Scalper] LOT_RISK_PCT: задайте InpRiskCalcSLPts > 0 (или InpStopLossPts > 0) "
+                     "для расчёта лота по риску. Сейчас фолбэк на InpLotFixed.");
+               warnedNoSL = true;
+              }
+            lot = InpLotFixed;
             break;
            }
          double balance = AccountInfoDouble(ACCOUNT_BALANCE);
          double riskMoney = balance * InpRiskPercent / 100.0;
          double tickVal   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
          double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-         if(tickSize <= 0.0 || tickVal <= 0.0) { lot = InpLotFixed; break; }
-         double slPrice   = InpStopLossPts * _Point;
+         if(tickSize <= 0.0 || tickVal <= 0.0)
+           {
+            PrintFormat("[Scalper] LOT_RISK_PCT: некорректные tickSize=%.5f tickVal=%.5f, фолбэк на InpLotFixed",
+                        tickSize, tickVal);
+            lot = InpLotFixed;
+            break;
+           }
+         double slPrice    = slForCalc * _Point;
          double lossPerLot = (slPrice / tickSize) * tickVal;
          if(lossPerLot <= 0.0) { lot = InpLotFixed; break; }
          lot = riskMoney / lossPerLot;
+
+         // Лог расчёта не чаще раза в 5 минут — иначе зальёт журнал
+         static datetime lastRiskLog = 0;
+         if(TimeCurrent() - lastRiskLog > 300)
+           {
+            PrintFormat("[Scalper] Риск-лот: bal=%.2f, риск=%.2f%% (%.2f %s), "
+                        "SL_calc=%dpts, потеря/лот=%.2f, лот=%.2f",
+                        balance, InpRiskPercent, riskMoney,
+                        AccountInfoString(ACCOUNT_CURRENCY),
+                        slForCalc, lossPerLot, lot);
+            lastRiskLog = TimeCurrent();
+           }
          break;
         }
 
@@ -375,6 +404,18 @@ bool OpenPosition(int dir)
    if(!g_sym.RefreshRates()) return false;
    double lot = CalcLot();
    if(lot <= 0.0) return false;
+
+   // Явный лог режима лота — чтобы было видно, что мартингейл/риск работают.
+   static int logCount = 0;
+   if(logCount < 5 || (logCount % 20) == 0)
+     {
+      string mode = (InpLotMode == LOT_FIXED)      ? "FIXED"
+                  : (InpLotMode == LOT_RISK_PCT)   ? "RISK_PCT"
+                  : "MARTINGALE";
+      PrintFormat("[Scalper] CalcLot[%s] -> %.2f (база=%.2f, текущ.мартингейл=%.2f, серия убытков=%d)",
+                  mode, lot, InpLotFixed, g_currentLot, g_lossStreak);
+     }
+   logCount++;
 
    double price = (dir > 0) ? g_sym.Ask() : g_sym.Bid();
    double sl    = 0.0;
@@ -591,6 +632,30 @@ int OnInit()
    g_currentLot   = InpLotFixed;
    g_lossStreak   = 0;
    g_equityPeak   = AccountInfoDouble(ACCOUNT_EQUITY);
+
+   // Захватываем ID самой свежей закрытой сделки EA на момент запуска,
+   // чтобы НЕ применять мартингейл на основе старой истории.
+   g_lastClosedDeal = 0;
+   if(HistorySelect(TimeCurrent() - 30*24*3600, TimeCurrent() + 60))
+     {
+      int htotal = HistoryDealsTotal();
+      datetime newestT = 0;
+      for(int i = htotal - 1; i >= 0; --i)
+        {
+         ulong tk = HistoryDealGetTicket(i);
+         if(tk == 0) continue;
+         if((string)HistoryDealGetString(tk, DEAL_SYMBOL) != _Symbol) continue;
+         if((long)HistoryDealGetInteger(tk, DEAL_MAGIC) != InpMagic) continue;
+         if((int)HistoryDealGetInteger(tk, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+         datetime t = (datetime)HistoryDealGetInteger(tk, DEAL_TIME);
+         if(t > newestT) { newestT = t; g_lastClosedDeal = tk; }
+        }
+     }
+   if(InpLotMode == LOT_MARTINGALE)
+      PrintFormat("[Scalper] Мартингейл активен: база=%.2f, x%.2f после убытка, потолок=%.2f, "
+                  "сброс после %d убытков. Стартовый лот=%.2f",
+                  InpLotFixed, InpMartingaleMult, InpMartingaleMaxLot,
+                  InpMaxLossesInRow, g_currentLot);
 
    PrintFormat("[Scalper] Запуск на %s %s. Лот=%.2f, TP=%dpts, SL=%dpts, Spread<=%dpts",
                _Symbol, EnumToString(_Period),
